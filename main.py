@@ -10,18 +10,19 @@ from pathlib import Path
 from typing import List, Optional
 from enum import Enum
 import base64
+import time
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QFileDialog, QMenuBar, QMenu,
     QListWidget, QListWidgetItem, QDialog, QFormLayout, QSpinBox,
-    QDialogButtonBox
+    QDialogButtonBox, QFrame
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QUrl, QThread, pyqtSignal, QObject, QByteArray
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PyQt6.QtGui import QAction, QKeySequence, QIcon, QPixmap
+from PyQt6.QtGui import QAction, QKeySequence, QIcon, QPixmap, QMouseEvent
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import mutagen
@@ -43,6 +44,21 @@ def icon_from_base64_png(b64: str) -> QIcon:
     pixmap.loadFromData(ba, "PNG")
 
     return QIcon(pixmap)
+
+
+class ClickableSlider(QSlider):
+    """Custom slider that allows clicking anywhere to seek"""
+    
+    def mousePressEvent(self, event: QMouseEvent):
+        """Handle mouse press to seek to clicked position"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Calculate the position based on where the user clicked
+            value = QSlider.minimum(self) + ((QSlider.maximum(self) - QSlider.minimum(self)) * event.position().x()) / self.width()
+            self.setValue(int(value))
+            self.sliderMoved.emit(int(value))
+            event.accept()
+        else:
+            super().mousePressEvent(event)
 
 
 class FileWatcherHandler(FileSystemEventHandler):
@@ -180,6 +196,11 @@ class Musibisk(QMainWindow):
         self.watcher_thread: Optional[FileWatcherThread] = None
         self.initial_songs_count: int = 50
         
+        # Delete button state
+        self.delete_click_count = 0
+        self.delete_last_click_time = 0
+        self.delete_last_song_index = -1
+        
         # Media player
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -262,8 +283,8 @@ class Musibisk(QMainWindow):
         time_layout.addWidget(self.duration_label)
         layout.addLayout(time_layout)
         
-        # Seek bar
-        self.seek_slider = QSlider(Qt.Orientation.Horizontal)
+        # Seek bar - using custom ClickableSlider
+        self.seek_slider = ClickableSlider(Qt.Orientation.Horizontal)
         self.seek_slider.setRange(0, 0)
         self.seek_slider.sliderMoved.connect(self.seek)
         self.seek_slider.setMaximumHeight(20)
@@ -296,11 +317,33 @@ class Musibisk(QMainWindow):
         self.loop_button.clicked.connect(self.toggle_loop_mode)
         self.update_loop_button()
         
+        # Add vertical separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        separator.setStyleSheet("color: #3d3d3d;")
+        separator.setFixedHeight(button_size)
+        
+        # Save button (floppy disk icon)
+        self.save_button = QPushButton("💾")
+        self.save_button.setFixedSize(button_size, button_size)
+        self.save_button.clicked.connect(self.toggle_save_song)
+        self.save_button.setToolTip("Save/unsave current song")
+        
+        # Delete button
+        self.delete_button = QPushButton("🗑")
+        self.delete_button.setFixedSize(button_size, button_size)
+        self.delete_button.clicked.connect(self.handle_delete_click)
+        self.delete_button.setToolTip("Double-click to delete song")
+        
         controls_layout.addStretch()
         controls_layout.addWidget(self.prev_button)
         controls_layout.addWidget(self.play_pause_button)
         controls_layout.addWidget(self.next_button)
         controls_layout.addWidget(self.loop_button)
+        controls_layout.addWidget(separator)
+        controls_layout.addWidget(self.save_button)
+        controls_layout.addWidget(self.delete_button)
         controls_layout.addStretch()
         
         layout.addLayout(controls_layout)
@@ -490,6 +533,7 @@ class Musibisk(QMainWindow):
         self.playlist.clear()
         self.playlist_widget.clear()
         
+        # Add files in order (most recent first, so they appear at top)
         for file in files:
             self.playlist.append(file)
             self.add_to_playlist_widget(file)
@@ -504,22 +548,34 @@ class Musibisk(QMainWindow):
         """Add a new file to the playlist"""
         path = Path(filepath)
         if path not in self.playlist:
-            self.playlist.append(path)
-            self.add_to_playlist_widget(path)
+            # Insert at the beginning (top) of the playlist
+            self.playlist.insert(0, path)
+            self.add_to_playlist_widget_at_top(path)
+            
+            # Adjust current index if necessary
+            if self.current_index >= 0:
+                self.current_index += 1
             
             # If nothing is playing, start playing this
             if self.current_index == -1:
-                self.current_index = len(self.playlist) - 1
+                self.current_index = 0
                 self.load_current_song()
                 self.highlight_current_song()
                 self.player.play()
     
     def add_to_playlist_widget(self, filepath: Path):
-        """Add a song to the playlist widget"""
+        """Add a song to the playlist widget (at the end)"""
         song_name = self.get_song_name(filepath)
         item = QListWidgetItem(f"♪ {song_name}")
         item.setData(Qt.ItemDataRole.UserRole, filepath)
         self.playlist_widget.addItem(item)
+    
+    def add_to_playlist_widget_at_top(self, filepath: Path):
+        """Add a song to the playlist widget at the top"""
+        song_name = self.get_song_name(filepath)
+        item = QListWidgetItem(f"♪ {song_name}")
+        item.setData(Qt.ItemDataRole.UserRole, filepath)
+        self.playlist_widget.insertItem(0, item)
     
     def on_playlist_item_clicked(self, item: QListWidgetItem):
         """Handle playlist item double-click"""
@@ -531,6 +587,9 @@ class Musibisk(QMainWindow):
             self.highlight_current_song()
             self.player.play()
             self.play_pause_button.setText("⏸")
+            
+            # Reset delete click counter when changing songs
+            self.reset_delete_state()
         except ValueError:
             pass
     
@@ -551,6 +610,9 @@ class Musibisk(QMainWindow):
             
             # Highlight in playlist
             self.highlight_current_song()
+            
+            # Update save button appearance
+            self.update_save_button()
     
     def get_song_name(self, filepath: Path) -> str:
         """Extract song name from metadata or use filename"""
@@ -573,6 +635,150 @@ class Musibisk(QMainWindow):
         
         # Fallback to filename without extension
         return filepath.stem
+    
+    def is_song_saved(self, filepath: Path) -> bool:
+        """Check if a song is marked as saved (has *_ prefix)"""
+        return filepath.name.startswith("*_")
+    
+    def toggle_save_song(self):
+        """Toggle the save status of the current song"""
+        if self.current_index < 0 or self.current_index >= len(self.playlist):
+            return
+        
+        current_file = self.playlist[self.current_index]
+        
+        if not current_file.exists():
+            return
+        
+        # Determine new filename
+        if self.is_song_saved(current_file):
+            # Remove *_ prefix
+            new_name = current_file.name[2:]  # Remove first 2 characters (*_)
+        else:
+            # Add *_ prefix
+            new_name = f"*_{current_file.name}"
+        
+        new_path = current_file.parent / new_name
+        
+        try:
+            # Rename the file
+            current_file.rename(new_path)
+            
+            # Update playlist
+            self.playlist[self.current_index] = new_path
+            
+            # Update playlist widget
+            self.refresh_playlist_widget()
+            
+            # Update current song display
+            song_name = self.get_song_name(new_path)
+            self.song_label.setText(song_name)
+            
+            # Update save button appearance
+            self.update_save_button()
+            
+        except Exception as e:
+            print(f"Error renaming file: {e}")
+    
+    def update_save_button(self):
+        """Update save button appearance based on current song's save status"""
+        if self.current_index >= 0 and self.current_index < len(self.playlist):
+            current_file = self.playlist[self.current_index]
+            if self.is_song_saved(current_file):
+                self.save_button.setStyleSheet("""
+                    QPushButton {
+                        background-color: #2d7d2d;
+                        color: #ffffff;
+                        border: 1px solid #3d3d3d;
+                        border-radius: 10px;
+                        font-size: 18px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #3d9d3d;
+                        border: 1px solid #4d4d4d;
+                    }
+                    QPushButton:pressed {
+                        background-color: #1a5a1a;
+                    }
+                """)
+            else:
+                # Reset to default style
+                self.save_button.setStyleSheet("")
+    
+    def refresh_playlist_widget(self):
+        """Refresh the playlist widget to reflect updated filenames"""
+        self.playlist_widget.clear()
+        for file in self.playlist:
+            self.add_to_playlist_widget(file)
+        self.highlight_current_song()
+    
+    def reset_delete_state(self):
+        """Reset delete button click state"""
+        self.delete_click_count = 0
+        self.delete_last_click_time = 0
+        self.delete_last_song_index = -1
+    
+    def handle_delete_click(self):
+        """Handle delete button click with double-click detection"""
+        current_time = time.time()
+        
+        # If song changed, reset state
+        if self.delete_last_song_index != self.current_index:
+            self.reset_delete_state()
+            self.delete_last_song_index = self.current_index
+        
+        # Check if this is within 1 second of last click
+        if current_time - self.delete_last_click_time <= 1.0:
+            # Second click within time window - delete the song
+            self.delete_click_count += 1
+            if self.delete_click_count >= 2:
+                self.delete_current_song()
+                self.reset_delete_state()
+        else:
+            # First click or too much time passed
+            self.delete_click_count = 1
+            self.delete_last_click_time = current_time
+    
+    def delete_current_song(self):
+        """Delete the current song file and move to next"""
+        if self.current_index < 0 or self.current_index >= len(self.playlist):
+            return
+        
+        current_file = self.playlist[self.current_index]
+        
+        if not current_file.exists():
+            return
+        
+        try:
+            # Stop playback
+            self.player.stop()
+            
+            # Delete the file
+            current_file.unlink()
+            
+            # Remove from playlist
+            del self.playlist[self.current_index]
+            self.playlist_widget.takeItem(self.current_index)
+            
+            # Move to next song or stop if no more songs
+            if self.playlist:
+                # Adjust index if at end
+                if self.current_index >= len(self.playlist):
+                    self.current_index = len(self.playlist) - 1
+                
+                # Load and play next song
+                self.load_current_song()
+                self.player.play()
+                self.play_pause_button.setText("⏸")
+            else:
+                # No more songs
+                self.current_index = -1
+                self.song_label.setText("No song loaded")
+                self.play_pause_button.setText("▶")
+            
+        except Exception as e:
+            print(f"Error deleting file: {e}")
     
     def toggle_play_pause(self):
         """Toggle between play and pause"""
@@ -599,6 +805,9 @@ class Musibisk(QMainWindow):
             self.load_current_song()
             self.player.play()
             self.play_pause_button.setText("⏸")
+        
+        # Reset delete state when changing songs
+        self.reset_delete_state()
     
     def previous_song(self):
         """Go to previous song"""
@@ -613,6 +822,9 @@ class Musibisk(QMainWindow):
             self.load_current_song()
             self.player.play()
             self.play_pause_button.setText("⏸")
+        
+        # Reset delete state when changing songs
+        self.reset_delete_state()
     
     def toggle_loop_mode(self):
         """Cycle through loop modes"""
