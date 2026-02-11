@@ -16,24 +16,26 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QFileDialog, QMenuBar, QMenu,
     QListWidget, QListWidgetItem, QDialog, QFormLayout, QSpinBox,
-    QDialogButtonBox, QFrame
+    QDialogButtonBox, QFrame, QDial
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QUrl, QThread, pyqtSignal, QObject, QByteArray
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PyQt6.QtGui import QAction, QKeySequence, QIcon, QPixmap, QMouseEvent
+from PyQt6.QtGui import (
+    QAction, QKeySequence, QIcon, QPixmap, QMouseEvent, QFont, QFontDatabase
+)
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import mutagen
-from icon import ICON_PNG_BASE64
-
-from icon import ICON_PNG_BASE64
+from resources import ICON_PNG_BASE64, BITMAP_FONT
 
 class LoopMode(Enum):
     NO_LOOP = 0
     LOOP_PLAYLIST = 1
     LOOP_SINGLE = 2
+    
+BUTTON_FONT_SIZE = "font-size: 20px;"
     
     
 def icon_from_base64_png(b64: str) -> QIcon:
@@ -45,6 +47,7 @@ def icon_from_base64_png(b64: str) -> QIcon:
 
     return QIcon(pixmap)
 
+BitmapFontFamily = None
 
 class ClickableSlider(QSlider):
     """Custom slider that allows clicking anywhere to seek"""
@@ -248,26 +251,27 @@ class Musibisk(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
-        layout.setContentsMargins(15, 5, 15, 15)
+        layout.setContentsMargins(8, 5, 8, 15)
         layout.setSpacing(8)
         
         # Directory label at top
         self.dir_label = QLabel("No directory selected")
         self.dir_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.dir_label.setStyleSheet("font-size: 10px; color: #888; padding: 2px;")
+        self.dir_label.setStyleSheet(f"font-size: 10px; color: #888; padding: 2px; font-family: {BitmapFontFamily};")
         self.dir_label.setMaximumHeight(16)
         layout.addWidget(self.dir_label)
         
         # Playlist view
         self.playlist_widget = QListWidget()
         self.playlist_widget.setMaximumHeight(180)
+        self.playlist_widget.setStyleSheet(f"font-family: {BitmapFontFamily};")
         self.playlist_widget.itemDoubleClicked.connect(self.on_playlist_item_clicked)
         layout.addWidget(self.playlist_widget)
         
         # Song info
         self.song_label = QLabel("No song loaded")
         self.song_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.song_label.setStyleSheet("font-size: 14px; font-weight: bold; padding: 4px 0;")
+        self.song_label.setStyleSheet(f"font-size: 14px; font-weight: bold; padding: 4px 0; font-family: {BitmapFontFamily};")
         self.song_label.setMaximumHeight(30)
         layout.addWidget(self.song_label)
         
@@ -275,9 +279,9 @@ class Musibisk(QMainWindow):
         time_layout = QHBoxLayout()
         time_layout.setContentsMargins(0, 0, 0, 0)
         self.time_label = QLabel("0:00")
-        self.time_label.setStyleSheet("font-size: 11px; color: #aaa;")
+        self.time_label.setStyleSheet(f"font-size: 11px; color: #aaa; font-family: {BitmapFontFamily};")
         self.duration_label = QLabel("0:00")
-        self.duration_label.setStyleSheet("font-size: 11px; color: #aaa;")
+        self.duration_label.setStyleSheet(f"font-size: 11px; color: #aaa; font-family: {BitmapFontFamily};")
         time_layout.addWidget(self.time_label)
         time_layout.addStretch()
         time_layout.addWidget(self.duration_label)
@@ -301,18 +305,22 @@ class Musibisk(QMainWindow):
         button_size = 45  # All buttons same size
         
         self.prev_button = QPushButton("⏮")
+        self.prev_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.prev_button.setFixedSize(button_size, button_size)
         self.prev_button.clicked.connect(self.previous_song)
         
         self.play_pause_button = QPushButton("▶")
+        self.play_pause_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.play_pause_button.setFixedSize(button_size, button_size)
         self.play_pause_button.clicked.connect(self.toggle_play_pause)
         
         self.next_button = QPushButton("⏭")
+        self.next_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.next_button.setFixedSize(button_size, button_size)
         self.next_button.clicked.connect(self.next_song)
         
         self.loop_button = QPushButton("🔁")
+        self.loop_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.loop_button.setFixedSize(button_size, button_size)
         self.loop_button.clicked.connect(self.toggle_loop_mode)
         self.update_loop_button()
@@ -326,15 +334,38 @@ class Musibisk(QMainWindow):
         
         # Save button (floppy disk icon)
         self.save_button = QPushButton("💾")
+        self.save_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.save_button.setFixedSize(button_size, button_size)
         self.save_button.clicked.connect(self.toggle_save_song)
         self.save_button.setToolTip("Save/unsave current song")
         
         # Delete button
         self.delete_button = QPushButton("🗑")
+        self.delete_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.delete_button.setFixedSize(button_size, button_size)
         self.delete_button.clicked.connect(self.handle_delete_click)
         self.delete_button.setToolTip("Double-click to delete song")
+        
+        self.volume_slider = QSlider(Qt.Orientation.Vertical)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(int(self.audio_output.volume() * 100))
+        self.volume_slider.valueChanged.connect(self.handle_volume_slider)
+        self.volume_slider.setFixedWidth(20)
+        self.volume_slider.setFixedHeight(45)
+
+        self.volume_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                background: #333;
+                height: 4px;
+                border-radius: 2px;
+            }
+
+            QSlider::handle:horizontal {
+                background: #4CAF50;
+                width: 10px;
+                border-radius: 5px;
+            }
+            """)
         
         controls_layout.addStretch()
         controls_layout.addWidget(self.prev_button)
@@ -344,6 +375,8 @@ class Musibisk(QMainWindow):
         controls_layout.addWidget(separator)
         controls_layout.addWidget(self.save_button)
         controls_layout.addWidget(self.delete_button)
+        controls_layout.addWidget(separator)
+        controls_layout.addWidget(self.volume_slider)
         controls_layout.addStretch()
         
         layout.addLayout(controls_layout)
@@ -405,7 +438,7 @@ class Musibisk(QMainWindow):
                 color: #ffffff;
                 border: 1px solid #3d3d3d;
                 border-radius: 10px;
-                font-size: 18px;
+                font-size: 12px;
                 font-weight: bold;
             }
             QPushButton:hover {
@@ -640,6 +673,10 @@ class Musibisk(QMainWindow):
         """Check if a song is marked as saved (has *_ prefix)"""
         return filepath.name.startswith("*_")
     
+    def handle_volume_slider(self, value):
+        """Handle volume slider value change"""
+        self.audio_output.setVolume(value / 100.0)
+    
     def toggle_save_song(self):
         """Toggle the save status of the current song"""
         if self.current_index < 0 or self.current_index >= len(self.playlist):
@@ -687,24 +724,24 @@ class Musibisk(QMainWindow):
             if self.is_song_saved(current_file):
                 self.save_button.setStyleSheet("""
                     QPushButton {
-                        background-color: #2d7d2d;
+                        background-color: #C38C31;
                         color: #ffffff;
                         border: 1px solid #3d3d3d;
                         border-radius: 10px;
-                        font-size: 18px;
+                        BUTTON_FONT_SIZE
                         font-weight: bold;
                     }
                     QPushButton:hover {
-                        background-color: #3d9d3d;
+                        background-color: #ECAA40;
                         border: 1px solid #4d4d4d;
                     }
                     QPushButton:pressed {
-                        background-color: #1a5a1a;
+                        background-color: #ECAA40;
                     }
                 """)
             else:
                 # Reset to default style
-                self.save_button.setStyleSheet("")
+                self.save_button.setStyleSheet(BUTTON_FONT_SIZE)
     
     def refresh_playlist_widget(self):
         """Refresh the playlist widget to reflect updated filenames"""
@@ -838,13 +875,13 @@ class Musibisk(QMainWindow):
         """Update loop button appearance"""
         if self.loop_mode == LoopMode.NO_LOOP:
             self.loop_button.setText("↻")
-            self.loop_button.setStyleSheet("QPushButton { color: #888; }")
+            self.loop_button.setStyleSheet(f"QPushButton {{ color: #888; {BUTTON_FONT_SIZE} }}")
         elif self.loop_mode == LoopMode.LOOP_PLAYLIST:
             self.loop_button.setText("🔁")
-            self.loop_button.setStyleSheet("QPushButton { color: #4d9eff; }")
+            self.loop_button.setStyleSheet(f"QPushButton {{ color: #4d9eff; {BUTTON_FONT_SIZE} }}")
         else:  # LOOP_SINGLE
             self.loop_button.setText("🔂")
-            self.loop_button.setStyleSheet("QPushButton { color: #4d9eff; }")
+            self.loop_button.setStyleSheet(f"QPushButton {{ color: #4d9eff; {BUTTON_FONT_SIZE} }}")
     
     def seek(self, position):
         """Seek to position in current song"""
@@ -902,6 +939,7 @@ class Musibisk(QMainWindow):
             
             if 'volume' in config:
                 self.audio_output.setVolume(config['volume'])
+                self.volume_slider.setValue(int(config['volume'] * 100))
             
             if 'initial_songs_count' in config:
                 self.initial_songs_count = config['initial_songs_count']
@@ -962,8 +1000,11 @@ class Musibisk(QMainWindow):
 
 
 def main():
+    global BitmapFontFamily
     app = QApplication(sys.argv)
     app.setApplicationName("Musibisk")
+    bitmap_font_id = QFontDatabase.addApplicationFontFromData(QByteArray(base64.b64decode(BITMAP_FONT)))
+    BitmapFontFamily = QFontDatabase.applicationFontFamilies(bitmap_font_id)[0]
     icon = icon_from_base64_png(ICON_PNG_BASE64)
     app.setWindowIcon(icon)
     
