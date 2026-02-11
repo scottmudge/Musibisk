@@ -11,12 +11,14 @@ from typing import List, Optional
 from enum import Enum
 import base64
 import time
+from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QFileDialog, QMenuBar, QMenu,
     QListWidget, QListWidgetItem, QDialog, QFormLayout, QSpinBox,
-    QDialogButtonBox, QFrame, QDial
+    QDialogButtonBox, QFrame, QDial, QTableWidget, QTableWidgetItem,
+    QHeaderView
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QUrl, QThread, pyqtSignal, QObject, QByteArray
@@ -189,7 +191,7 @@ class Musibisk(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Musibisk")
-        self.setFixedSize(420, 400)
+        self.setFixedSize(450, 400)
         
         # State
         self.playlist: List[Path] = []
@@ -261,11 +263,24 @@ class Musibisk(QMainWindow):
         self.dir_label.setMaximumHeight(16)
         layout.addWidget(self.dir_label)
         
-        # Playlist view
-        self.playlist_widget = QListWidget()
+        # Playlist view - now using QTableWidget
+        self.playlist_widget = QTableWidget()
+        self.playlist_widget.setColumnCount(2)
+        self.playlist_widget.setHorizontalHeaderLabels(["Song", "Modified"])
         self.playlist_widget.setMaximumHeight(180)
         self.playlist_widget.setStyleSheet(f"font-family: {BitmapFontFamily};")
-        self.playlist_widget.itemDoubleClicked.connect(self.on_playlist_item_clicked)
+        self.playlist_widget.cellDoubleClicked.connect(self.on_playlist_item_clicked)
+        self.playlist_widget.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.playlist_widget.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.playlist_widget.verticalHeader().setVisible(False)
+        self.playlist_widget.setShowGrid(False)
+        
+        # Set column widths
+        header = self.playlist_widget.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.playlist_widget.setColumnWidth(1, 150)  # Fixed width for timestamp column
+        
         layout.addWidget(self.playlist_widget)
         
         # Song info
@@ -414,7 +429,7 @@ class Musibisk(QMainWindow):
             QMenu::item:selected {
                 background-color: #3d3d3d;
             }
-            QListWidget {
+            QTableWidget {
                 background-color: #2d2d2d;
                 color: #ffffff;
                 border: 1px solid #3d3d3d;
@@ -422,16 +437,21 @@ class Musibisk(QMainWindow):
                 padding: 4px;
                 font-size: 11px;
             }
-            QListWidget::item {
+            QTableWidget::item {
                 padding: 4px;
                 border-radius: 3px;
             }
-            QListWidget::item:selected {
+            QTableWidget::item:selected {
                 background-color: #4d9eff;
                 color: #ffffff;
             }
-            QListWidget::item:hover {
-                background-color: #3d3d3d;
+            QHeaderView::section {
+                background-color: #2d2d2d;
+                color: #aaa;
+                border: none;
+                padding: 4px;
+                font-size: 10px;
+                font-weight: bold;
             }
             QPushButton {
                 background-color: #2d2d2d;
@@ -564,7 +584,7 @@ class Musibisk(QMainWindow):
         
         # Clear playlist and add files
         self.playlist.clear()
-        self.playlist_widget.clear()
+        self.playlist_widget.setRowCount(0)
         
         # Add files in order (most recent first, so they appear at top)
         for file in files:
@@ -596,40 +616,76 @@ class Musibisk(QMainWindow):
                 self.highlight_current_song()
                 self.player.play()
     
+    def get_formatted_timestamp(self, filepath: Path) -> str:
+        """Get formatted timestamp for file modification time"""
+        try:
+            mtime = filepath.stat().st_mtime
+            dt = datetime.fromtimestamp(mtime)
+            return dt.strftime("%H:%M:%S %m/%d/%Y")
+        except:
+            return "Unknown"
+    
     def add_to_playlist_widget(self, filepath: Path):
         """Add a song to the playlist widget (at the end)"""
         song_name = self.get_song_name(filepath)
-        item = QListWidgetItem(f"♪ {song_name}")
-        item.setData(Qt.ItemDataRole.UserRole, filepath)
-        self.playlist_widget.addItem(item)
+        timestamp = self.get_formatted_timestamp(filepath)
+        
+        row = self.playlist_widget.rowCount()
+        self.playlist_widget.insertRow(row)
+        
+        # Song name column
+        song_item = QTableWidgetItem(f"♪ {song_name}")
+        song_item.setData(Qt.ItemDataRole.UserRole, filepath)
+        song_item.setFlags(song_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.playlist_widget.setItem(row, 0, song_item)
+        
+        # Timestamp column
+        time_item = QTableWidgetItem(timestamp)
+        time_item.setForeground(Qt.GlobalColor.gray)
+        time_item.setFlags(time_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.playlist_widget.setItem(row, 1, time_item)
     
     def add_to_playlist_widget_at_top(self, filepath: Path):
         """Add a song to the playlist widget at the top"""
         song_name = self.get_song_name(filepath)
-        item = QListWidgetItem(f"♪ {song_name}")
-        item.setData(Qt.ItemDataRole.UserRole, filepath)
-        self.playlist_widget.insertItem(0, item)
+        timestamp = self.get_formatted_timestamp(filepath)
+        
+        self.playlist_widget.insertRow(0)
+        
+        # Song name column
+        song_item = QTableWidgetItem(f"♪ {song_name}")
+        song_item.setData(Qt.ItemDataRole.UserRole, filepath)
+        song_item.setFlags(song_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.playlist_widget.setItem(0, 0, song_item)
+        
+        # Timestamp column
+        time_item = QTableWidgetItem(timestamp)
+        time_item.setForeground(Qt.GlobalColor.gray)
+        time_item.setFlags(time_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.playlist_widget.setItem(0, 1, time_item)
     
-    def on_playlist_item_clicked(self, item: QListWidgetItem):
+    def on_playlist_item_clicked(self, row: int, column: int):
         """Handle playlist item double-click"""
-        filepath = item.data(Qt.ItemDataRole.UserRole)
-        try:
-            index = self.playlist.index(filepath)
-            self.current_index = index
-            self.load_current_song()
-            self.highlight_current_song()
-            self.player.play()
-            self.play_pause_button.setText("⏸")
-            
-            # Reset delete click counter when changing songs
-            self.reset_delete_state()
-        except ValueError:
-            pass
+        item = self.playlist_widget.item(row, 0)
+        if item:
+            filepath = item.data(Qt.ItemDataRole.UserRole)
+            try:
+                index = self.playlist.index(filepath)
+                self.current_index = index
+                self.load_current_song()
+                self.highlight_current_song()
+                self.player.play()
+                self.play_pause_button.setText("⏸")
+                
+                # Reset delete click counter when changing songs
+                self.reset_delete_state()
+            except ValueError:
+                pass
     
     def highlight_current_song(self):
         """Highlight the currently playing song in the playlist"""
-        if 0 <= self.current_index < self.playlist_widget.count():
-            self.playlist_widget.setCurrentRow(self.current_index)
+        if 0 <= self.current_index < self.playlist_widget.rowCount():
+            self.playlist_widget.selectRow(self.current_index)
     
     def load_current_song(self):
         """Load the current song into the player"""
@@ -745,7 +801,7 @@ class Musibisk(QMainWindow):
     
     def refresh_playlist_widget(self):
         """Refresh the playlist widget to reflect updated filenames"""
-        self.playlist_widget.clear()
+        self.playlist_widget.setRowCount(0)
         for file in self.playlist:
             self.add_to_playlist_widget(file)
         self.highlight_current_song()
@@ -796,7 +852,7 @@ class Musibisk(QMainWindow):
             
             # Remove from playlist
             del self.playlist[self.current_index]
-            self.playlist_widget.takeItem(self.current_index)
+            self.playlist_widget.removeRow(self.current_index)
             
             # Move to next song or stop if no more songs
             if self.playlist:
