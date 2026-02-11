@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QSlider, QFileDialog, QMenuBar, QMenu,
     QListWidget, QListWidgetItem, QDialog, QFormLayout, QSpinBox,
     QDialogButtonBox, QFrame, QDial, QTableWidget, QTableWidgetItem,
-    QHeaderView
+    QHeaderView, QComboBox
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QUrl, QThread, pyqtSignal, QObject, QByteArray
@@ -36,6 +36,10 @@ class LoopMode(Enum):
     NO_LOOP = 0
     LOOP_PLAYLIST = 1
     LOOP_SINGLE = 2
+
+class PlayOrder(Enum):
+    OLDEST_TO_NEWEST = 0
+    NEWEST_TO_OLDEST = 1
     
 BUTTON_FONT_SIZE = "font-size: 20px;"
     
@@ -116,10 +120,10 @@ class FileWatcherThread(QThread):
 class SettingsDialog(QDialog):
     """Settings dialog for configuring Musibisk"""
     
-    def __init__(self, parent=None, initial_songs=50):
+    def __init__(self, parent=None, initial_songs=50, play_order=PlayOrder.OLDEST_TO_NEWEST):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setFixedSize(300, 120)
+        self.setFixedSize(300, 180)
         
         layout = QFormLayout(self)
         
@@ -129,6 +133,14 @@ class SettingsDialog(QDialog):
         self.songs_spinbox.setSuffix(" songs")
         
         layout.addRow("Initial playlist size:", self.songs_spinbox)
+        
+        # Play order dropdown
+        self.play_order_combo = QComboBox()
+        self.play_order_combo.addItem("Oldest to Newest", PlayOrder.OLDEST_TO_NEWEST)
+        self.play_order_combo.addItem("Newest to Oldest", PlayOrder.NEWEST_TO_OLDEST)
+        self.play_order_combo.setCurrentIndex(play_order.value)
+        
+        layout.addRow("Play order:", self.play_order_combo)
         
         # Buttons
         buttons = QDialogButtonBox(
@@ -150,7 +162,7 @@ class SettingsDialog(QDialog):
             QLabel {
                 color: #ffffff;
             }
-            QSpinBox {
+            QSpinBox, QComboBox {
                 background-color: #2d2d2d;
                 color: #ffffff;
                 border: 1px solid #3d3d3d;
@@ -163,6 +175,23 @@ class SettingsDialog(QDialog):
             }
             QSpinBox::up-button:hover, QSpinBox::down-button:hover {
                 background-color: #4d4d4d;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background-color: #3d3d3d;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #ffffff;
+                margin-right: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2d2d2d;
+                color: #ffffff;
+                selection-background-color: #4d9eff;
+                border: 1px solid #3d3d3d;
             }
             QPushButton {
                 background-color: #2d2d2d;
@@ -179,6 +208,10 @@ class SettingsDialog(QDialog):
     def get_songs_count(self):
         """Return the selected number of songs"""
         return self.songs_spinbox.value()
+    
+    def get_play_order(self):
+        """Return the selected play order"""
+        return self.play_order_combo.currentData()
 
 
 class Musibisk(QMainWindow):
@@ -197,6 +230,7 @@ class Musibisk(QMainWindow):
         self.playlist: List[Path] = []
         self.current_index: int = -1
         self.loop_mode = LoopMode.NO_LOOP
+        self.play_order = PlayOrder.OLDEST_TO_NEWEST
         self.target_directory: Optional[Path] = None
         self.watcher_thread: Optional[FileWatcherThread] = None
         self.initial_songs_count: int = 50
@@ -537,9 +571,11 @@ class Musibisk(QMainWindow):
     
     def show_settings(self):
         """Show settings dialog"""
-        dialog = SettingsDialog(self, self.initial_songs_count)
+        dialog = SettingsDialog(self, self.initial_songs_count, self.play_order)
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            old_play_order = self.play_order
             self.initial_songs_count = dialog.get_songs_count()
+            self.play_order = dialog.get_play_order()
             self.save_config()
             
             # Reload playlist if directory is set
@@ -567,6 +603,48 @@ class Musibisk(QMainWindow):
         # Save config
         self.save_config()
     
+    def get_next_index(self):
+        """Get the next song index based on play order"""
+        if not self.playlist:
+            return -1
+        
+        if self.play_order == PlayOrder.NEWEST_TO_OLDEST:
+            # Moving forward through the list (bottom to top in display)
+            return (self.current_index + 1) % len(self.playlist)
+        else:  # NEWEST_TO_OLDEST
+            # Moving backward through the list (top to bottom in display)
+            next_idx = self.current_index - 1
+            if next_idx < 0:
+                next_idx = len(self.playlist) - 1
+            return next_idx
+    
+    def get_previous_index(self):
+        """Get the previous song index based on play order"""
+        if not self.playlist:
+            return -1
+        
+        if self.play_order == PlayOrder.NEWEST_TO_OLDEST:
+            # Moving backward through the list (top to bottom in display)
+            prev_idx = self.current_index - 1
+            if prev_idx < 0:
+                prev_idx = len(self.playlist) - 1
+            return prev_idx
+        else:  # NEWEST_TO_OLDEST
+            # Moving forward through the list (bottom to top in display)
+            return (self.current_index + 1) % len(self.playlist)
+    
+    def get_starting_index(self):
+        """Get the index to start playing from based on play order"""
+        if not self.playlist:
+            return -1
+        
+        if self.play_order == PlayOrder.NEWEST_TO_OLDEST:
+            # Start at the end (oldest song, which is at bottom)
+            return len(self.playlist) - 1
+        else:  # NEWEST_TO_OLDEST
+            # Start at the beginning (newest song, which is at top)
+            return 0
+    
     def load_existing_files(self, directory: Path, limit: Optional[int] = None):
         """Load existing audio files from directory"""
         if limit is None:
@@ -591,9 +669,9 @@ class Musibisk(QMainWindow):
             self.playlist.append(file)
             self.add_to_playlist_widget(file)
         
-        # Start playing first song if playlist not empty
+        # Start playing from the appropriate position based on play order
         if self.playlist and self.current_index == -1:
-            self.current_index = 0
+            self.current_index = self.get_starting_index()
             self.load_current_song()
             self.highlight_current_song()
     
@@ -609,9 +687,9 @@ class Musibisk(QMainWindow):
             if self.current_index >= 0:
                 self.current_index += 1
             
-            # If nothing is playing, start playing this
+            # If nothing is playing, start playing from the appropriate position
             if self.current_index == -1:
-                self.current_index = 0
+                self.current_index = self.get_starting_index()
                 self.load_current_song()
                 self.highlight_current_song()
                 self.player.play()
@@ -880,7 +958,7 @@ class Musibisk(QMainWindow):
             self.play_pause_button.setText("▶")
         else:
             if self.current_index == -1 and self.playlist:
-                self.current_index = 0
+                self.current_index = self.get_starting_index()
                 self.load_current_song()
             self.player.play()
             self.play_pause_button.setText("⏸")
@@ -894,7 +972,7 @@ class Musibisk(QMainWindow):
             self.player.setPosition(0)
             self.player.play()
         else:
-            self.current_index = (self.current_index + 1) % len(self.playlist)
+            self.current_index = self.get_next_index()
             self.load_current_song()
             self.player.play()
             self.play_pause_button.setText("⏸")
@@ -911,7 +989,7 @@ class Musibisk(QMainWindow):
         if self.player.position() > 3000:
             self.player.setPosition(0)
         else:
-            self.current_index = (self.current_index - 1) % len(self.playlist)
+            self.current_index = self.get_previous_index()
             self.load_current_song()
             self.player.play()
             self.play_pause_button.setText("⏸")
@@ -969,11 +1047,21 @@ class Musibisk(QMainWindow):
             elif self.loop_mode == LoopMode.LOOP_PLAYLIST:
                 self.next_song()
             else:
-                # No loop - stop at end
-                if self.current_index < len(self.playlist) - 1:
-                    self.next_song()
-                else:
-                    self.play_pause_button.setText("▶")
+                # No loop - check if we should continue based on play order
+                if self.play_order == PlayOrder.NEWEST_TO_OLDEST:
+                    # Playing oldest to newest (bottom to top)
+                    # Continue if not at top (index 0)
+                    if self.current_index > 0:
+                        self.next_song()
+                    else:
+                        self.play_pause_button.setText("▶")
+                else:  # NEWEST_TO_OLDEST
+                    # Playing newest to oldest (top to bottom)
+                    # Continue if not at bottom (last index)
+                    if self.current_index < len(self.playlist) - 1:
+                        self.next_song()
+                    else:
+                        self.play_pause_button.setText("▶")
     
     def load_config(self):
         """Load configuration from file"""
@@ -993,6 +1081,9 @@ class Musibisk(QMainWindow):
                 self.loop_mode = LoopMode(config['loop_mode'])
                 self.update_loop_button()
             
+            if 'play_order' in config:
+                self.play_order = PlayOrder(config['play_order'])
+            
             if 'volume' in config:
                 self.audio_output.setVolume(config['volume'])
                 self.volume_slider.setValue(int(config['volume'] * 100))
@@ -1009,6 +1100,7 @@ class Musibisk(QMainWindow):
         
         config = {
             'loop_mode': self.loop_mode.value,
+            'play_order': self.play_order.value,
             'volume': self.audio_output.volume(),
             'initial_songs_count': self.initial_songs_count
         }
