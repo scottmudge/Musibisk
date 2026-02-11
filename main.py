@@ -251,7 +251,7 @@ class Musibisk(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
-        layout.setContentsMargins(8, 5, 8, 15)
+        layout.setContentsMargins(8, 5, 8, 8)
         layout.setSpacing(8)
         
         # Directory label at top
@@ -722,22 +722,22 @@ class Musibisk(QMainWindow):
         if self.current_index >= 0 and self.current_index < len(self.playlist):
             current_file = self.playlist[self.current_index]
             if self.is_song_saved(current_file):
-                self.save_button.setStyleSheet("""
-                    QPushButton {
+                self.save_button.setStyleSheet(f"""
+                    QPushButton {{
                         background-color: #C38C31;
                         color: #ffffff;
                         border: 1px solid #3d3d3d;
                         border-radius: 10px;
-                        BUTTON_FONT_SIZE
+                        {BUTTON_FONT_SIZE}
                         font-weight: bold;
-                    }
-                    QPushButton:hover {
+                    }}
+                    QPushButton:hover {{
                         background-color: #ECAA40;
                         border: 1px solid #4d4d4d;
-                    }
-                    QPushButton:pressed {
+                    }}
+                    QPushButton:pressed {{
                         background-color: #ECAA40;
-                    }
+                    }}
                 """)
             else:
                 # Reset to default style
