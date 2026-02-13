@@ -18,14 +18,17 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QSlider, QFileDialog, QMenuBar, QMenu,
     QListWidget, QListWidgetItem, QDialog, QFormLayout, QSpinBox,
     QDialogButtonBox, QFrame, QDial, QTableWidget, QTableWidgetItem,
-    QHeaderView, QComboBox
+    QHeaderView, QComboBox, QStyledItemDelegate, QStyleOptionViewItem,
+    QStyle
 )
 from PyQt6.QtCore import (
-    Qt, QTimer, QUrl, QThread, pyqtSignal, QObject, QByteArray
+    Qt, QTimer, QUrl, QThread, pyqtSignal, QObject, QByteArray,
+    QModelIndex
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import (
-    QAction, QKeySequence, QIcon, QPixmap, QMouseEvent, QFont, QFontDatabase
+    QAction, QKeySequence, QIcon, QPixmap, QMouseEvent, QFont, QFontDatabase,
+    QBrush, QColor, QPainter
 )
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -117,13 +120,55 @@ class FileWatcherThread(QThread):
         self.quit()
 
 
+class PlaylistDelegate(QStyledItemDelegate):
+    """Custom delegate to highlight the currently playing song"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.playing_row = -1
+        self.default_bg = QColor("#2d2d2d")
+        self.playing_bg = QColor("#505050")  # Lighter gray
+        self.beige_gold = QColor("#E8D4A0")
+        self.white = QColor("#ffffff")
+        self.gray = QColor("#888888")
+    
+    def set_playing_row(self, row: int):
+        """Set which row is currently playing"""
+        self.playing_row = row
+    
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex):
+        """Custom paint to show playing song background"""
+        painter.save()
+        
+        is_playing = (index.row() == self.playing_row)
+        bg_color = self.playing_bg if is_playing else self.default_bg
+        painter.fillRect(option.rect, bg_color)
+        
+        # FIXED: Use QStyle.StateFlag.State_Selected
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(option.rect, QColor("#4d9eff"))
+        
+        painter.restore()
+        
+        modified_option = QStyleOptionViewItem(option)
+        if is_playing:
+            modified_option.palette.setColor(modified_option.palette.ColorRole.Text, self.beige_gold)
+        else:
+            if index.column() == 0:
+                modified_option.palette.setColor(modified_option.palette.ColorRole.Text, self.white)
+            else:
+                modified_option.palette.setColor(modified_option.palette.ColorRole.Text, self.gray)
+        
+        super().paint(painter, modified_option, index)
+
+
 class SettingsDialog(QDialog):
     """Settings dialog for configuring Musibisk"""
     
     def __init__(self, parent=None, initial_songs=50, play_order=PlayOrder.OLDEST_TO_NEWEST):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setFixedSize(300, 180)
+        self.setFixedSize(300, 120)
         
         layout = QFormLayout(self)
         
@@ -308,6 +353,9 @@ class Musibisk(QMainWindow):
         self.playlist_widget.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.playlist_widget.verticalHeader().setVisible(False)
         self.playlist_widget.setShowGrid(False)
+        
+        self.playlist_delegate = PlaylistDelegate(self.playlist_widget)
+        self.playlist_widget.setItemDelegate(self.playlist_delegate)
         
         # Set column widths
         header = self.playlist_widget.horizontalHeader()
@@ -521,6 +569,62 @@ class Musibisk(QMainWindow):
             QSlider::sub-page:horizontal {
                 background: #4d9eff;
                 border-radius: 3px;
+            }
+            QScrollBar:vertical:goove {
+                background-color: #1e1e1e;
+                width: 12px;
+                border-radius: 4px;
+                border: 1px solid #3d3d3d;
+            }
+            QScrollBar:vertical {
+                background-color: #1e1e1e;
+                width: 12px;
+                border-radius: 4px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #4d4d4d;
+                border-radius: 4px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #5d5d5d;
+            }
+            QScrollBar::handle:vertical:pressed {
+                background-color: #6d6d6d;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: none;
+            }
+            QScrollBar:horizontal {
+                background-color: #1e1e1e;
+                height: 12px;
+                border-radius: 6px;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #4d4d4d;
+                border-radius: 6px;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background-color: #5d5d5d;
+            }
+            QScrollBar::handle:horizontal:pressed {
+                background-color: #6d6d6d;
+            }
+            QScrollBar::add-line:horizontal,
+            QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QScrollBar::add-page:horizontal,
+            QScrollBar::sub-page:horizontal {
+                background: none;
             }
         """)
     
@@ -762,8 +866,9 @@ class Musibisk(QMainWindow):
     
     def highlight_current_song(self):
         """Highlight the currently playing song in the playlist"""
-        if 0 <= self.current_index < self.playlist_widget.rowCount():
-            self.playlist_widget.selectRow(self.current_index)
+        self.playlist_delegate.set_playing_row(self.current_index)
+        self.playlist_widget.viewport().update()
+
     
     def load_current_song(self):
         """Load the current song into the player"""
