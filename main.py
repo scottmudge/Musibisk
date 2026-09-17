@@ -985,18 +985,23 @@ class WaveformVisualizer(QWidget):
     upcoming/dim) — no per-frame decoding and no per-frame bitmap
     generation. Vertex positions are sub-pixel floats, so the scroll is
     perfectly smooth (QPainter rounds fractional *image* blits, but
-    antialiased vector geometry honors the fraction). A 16 ms timer (near
-    60 FPS) runs only while audio is actually playing. The player's coarse,
-    slightly late position reports are absorbed by a short easing ramp
-    instead of snapping, so the motion never jerks.
+    antialiased vector geometry honors the fraction).
+
+    The playhead sits at the horizontal middle; the position is a local
+    time line (anchored to the first player report, advanced by the real
+    clock) plus a persistent low-passed correction for the player's coarse,
+    slightly late reports — constant between reports, so the scroll speed
+    never pulses. Frames are drawn on a drift-corrected 60 FPS grid via a
+    4 ms timer, which itself runs only while audio is actually playing.
     """
     HEIGHT = 44
-    # Tunable knob — sets BOTH the horizontal resolution and the scroll
+    #     Tunable knob — sets BOTH the horizontal resolution and the scroll
     # speed: N waveform columns per second of audio, i.e. the display
-    # scrolls at N pixels/second and shows (width / N) seconds of context.
+    # scrolls at N pixels/second and shows (width / N) seconds of context
+    # (half behind, half ahead of the centered playhead).
     #   60  -> slow, ~4.3 s visible    120 -> 2x (default)    240 -> 4x
     COLS_PER_SECOND = 120
-    PLAYHEAD_RATIO = 0.72
+    PLAYHEAD_RATIO = 0.5  # playhead ("now" line) at the horizontal middle
 
     BG_COLOR = QColor('#1b1b1b')
     BORDER_COLOR = QColor('#3d3d3d')
@@ -1005,8 +1010,10 @@ class WaveformVisualizer(QWidget):
     PLACEHOLDER_COLOR = QColor('#333333')
     PLAYHEAD_COLOR = QColor('#ffffff')
 
-    _EASE_MS = 300.0          # report corrections spread over this time
+    _ALPHA = 0.25            # per-report low-pass factor on the clock offset
     _SNAP_THRESHOLD_MS = 1500.0  # larger discontinuities (seeks) snap
+    _FRAME_PERIOD = 1000.0 / 60.0  # 60 FPS drawing grid
+    _TIMER_MS = 2            # wake frequently enough to hit the grid on time
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1018,15 +1025,14 @@ class WaveformVisualizer(QWidget):
         self._playing = False
         self._anchor_pos = 0.0    # ms, base position
         self._anchor_time = 0.0   # clock ms of the anchor
-        self._offset = 0.0        # ms, eased correction applied
-        self._target_offset = 0.0  # ms, correction to ease towards
-        self._last_tick = 0.0
+        self._offset_init = False  # no report anchored the line yet
+        self._offset = 0.0        # ms, persistent low-passed clock correction
+        self._next_frame = 0.0    # clock ms of the next scheduled draw
         self._clock = QElapsedTimer()
         self._timer = QTimer(self)
-        self._timer.setInterval(16)
+        self._timer.setInterval(self._TIMER_MS)
         self._timer.timeout.connect(self._tick)
         self._clock.start()
-        self._last_tick = self._clock.elapsed()
 
     # ---------------------------------------------------------------- API
     def set_track(self, filepath):
@@ -1039,8 +1045,8 @@ class WaveformVisualizer(QWidget):
         self._peaks = []
         self._anchor_pos = 0.0
         self._anchor_time = self._clock.elapsed()
+        self._offset_init = False
         self._offset = 0.0
-        self._target_offset = 0.0
         if self._worker is not None:
             self._worker.wait(2000)
         self._worker = _WaveformWorker(self._generation, filepath)
@@ -1062,9 +1068,15 @@ class WaveformVisualizer(QWidget):
         if playing == self._playing:
             return
         self._playing = playing
-        if playing and self._peaks:
-            self._last_tick = self._clock.elapsed()
-            self._timer.start()
+        if playing:
+            if not self._offset_init:
+                # fresh track: the position starts at zero NOW (the anchor
+                # set in set_track may predate the actual playback start)
+                self._anchor_pos = 0.0
+                self._anchor_time = self._clock.elapsed()
+            self._next_frame = self._clock.elapsed() + self._FRAME_PERIOD
+            if self._peaks:
+                self._timer.start()
         else:
             self._timer.stop()
         self.update()
@@ -1072,28 +1084,33 @@ class WaveformVisualizer(QWidget):
     def note_position(self, pos_ms: int):
         """Feed a player position report (from positionChanged).
 
-        While playing, reports are coarse and arrive late, so the error
-        versus the locally extrapolated position is eased in over
-        _EASE_MS instead of snapping — that is what keeps the scroll
-        jerk-free. Big discontinuities (seeks) snap immediately.
+        The player reports coarsely and slightly late. The first report
+        anchors the local time line; afterwards a report's deviation from
+        the line is a low-passed correction to a PERSISTENT offset, so
+        the scroll speed stays perfectly constant between reports (a
+        transient ease-out per report would pulse with the report rate).
+        Big discontinuities (seeks) snap immediately.
         """
         now = self._clock.elapsed()
         if self._playing:
-            err = float(pos_ms) - self._current_position()
-            if abs(err) > self._SNAP_THRESHOLD_MS:
+            base = self._anchor_pos + (now - self._anchor_time)
+            dev = float(pos_ms) - base
+            if not self._offset_init:
                 self._anchor_pos = float(pos_ms)
                 self._anchor_time = now
                 self._offset = 0.0
-                self._target_offset = 0.0
+                self._offset_init = True
+            elif abs(dev - self._offset) > self._SNAP_THRESHOLD_MS:
+                self._anchor_pos = float(pos_ms)
+                self._anchor_time = now
+                self._offset = 0.0
             else:
-                self._target_offset += max(
-                    -self._SNAP_THRESHOLD_MS,
-                    min(self._SNAP_THRESHOLD_MS, err))
+                self._offset += (dev - self._offset) * self._ALPHA
         else:
             self._anchor_pos = float(pos_ms)
             self._anchor_time = now
             self._offset = 0.0
-            self._target_offset = 0.0
+            self._offset_init = False
         if not self._playing or not self._timer.isActive():
             self.update()
 
@@ -1103,12 +1120,13 @@ class WaveformVisualizer(QWidget):
             return
         self._peaks = peaks
         if self._playing:
+            self._next_frame = self._clock.elapsed() + self._FRAME_PERIOD
             self._timer.start()
         self.update()
 
     def _current_position(self):
-        """Playback position in ms: local extrapolation (linear between the
-        player's coarse reports) plus the eased correction."""
+        """Playback position in ms: the anchored time line (linear between
+        the player's coarse reports) plus the persistent clock correction."""
         pos = self._anchor_pos
         if self._playing:
             pos += self._clock.elapsed() - self._anchor_time
@@ -1116,12 +1134,16 @@ class WaveformVisualizer(QWidget):
         return max(0.0, pos)
 
     def _tick(self):
+        # Draw on a drift-corrected 60 FPS grid: uniform frame spacing
+        # keeps the perceived scroll speed constant (a plain 16 ms timer
+        # drifts against the display refresh and reads as speed pulsing).
         now = self._clock.elapsed()
-        dt = now - self._last_tick
-        self._last_tick = now
-        if dt > 0:
-            k = min(1.0, dt / self._EASE_MS)
-            self._offset += (self._target_offset - self._offset) * k
+        if now < self._next_frame:
+            return
+        if now - self._next_frame > 30.0:
+            self._next_frame = now + self._FRAME_PERIOD
+        else:
+            self._next_frame += self._FRAME_PERIOD
         self.update()
 
     def _band(self, painter, c_start, c_end, pf, phx, mid, scale, color):
