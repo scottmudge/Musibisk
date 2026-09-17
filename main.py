@@ -2197,11 +2197,9 @@ class Musibisk(QMainWindow):
             with open(self.CONFIG_FILE, 'r') as f:
                 config = json.load(f)
             
-            if 'target_directory' in config:
-                directory = Path(config['target_directory'])
-                if directory.exists():
-                    self.set_target_directory(directory)
-            
+            # Apply the scalar settings FIRST: set_target_directory builds
+            # the playlist immediately, and it must already use the saved
+            # initial_songs_count / play_order.
             if 'loop_mode' in config:
                 self.loop_mode = LoopMode(config['loop_mode'])
                 self.update_loop_button()
@@ -2233,6 +2231,11 @@ class Musibisk(QMainWindow):
             
             if 'sync_password' in config:
                 self.sync_password = decrypt_secret(config['sync_password'])
+            
+            if 'target_directory' in config:
+                directory = Path(config['target_directory'])
+                if directory.exists():
+                    self.set_target_directory(directory)
                 
         except Exception as e:
             print(f"Error loading config: {e}")
