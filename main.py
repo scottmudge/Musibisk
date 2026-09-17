@@ -7,6 +7,8 @@ import sys
 import json
 import os
 import re
+import struct
+import subprocess
 import queue
 from pathlib import Path
 from typing import List, Optional
@@ -26,12 +28,12 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QUrl, QThread, pyqtSignal, QObject, QByteArray,
-    QModelIndex, QRect
+    QModelIndex, QRect, QElapsedTimer, QPointF
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import (
     QAction, QKeySequence, QIcon, QPixmap, QMouseEvent, QFont, QFontDatabase,
-    QBrush, QColor, QPainter, QPainterPath
+    QBrush, QColor, QPainter, QPainterPath, QPolygonF
 )
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -896,14 +898,299 @@ class GlyphCenteredButton(QPushButton):
         super().setStyleSheet(self._sheet_with_padding())
 
 
+def compute_waveform_peaks(filepath, cols_per_second=120):
+    """Compute a normalized amplitude profile (values in (0, 1]) for a file,
+    one value per column of a WaveformVisualizer.
+
+    Decodes the track once with ffmpeg (mono float32, 10 samples per
+    column) when available; falls back to a content-energy heuristic on the
+    raw bytes so the visualizer still works without ffmpeg. Returns [] on
+    failure.
+    """
+    decode_rate = cols_per_second * 10
+    data = None
+    try:
+        proc = subprocess.run(
+            ['ffmpeg', '-v', 'error', '-i', str(filepath),
+             '-f', 'f32le', '-acodec', 'pcm_f32le', '-ac', '1',
+             '-ar', str(decode_rate), '-'],
+            capture_output=True, timeout=60)
+        data = proc.stdout
+    except Exception:
+        data = None
+
+    if data and len(data) >= 4:
+        samples = struct.unpack(f'<{len(data) // 4}f', data)
+        per = max(1, decode_rate // cols_per_second)
+        peaks = []
+        for i in range(0, len(samples) - (len(samples) % per), per):
+            top = 0.0
+            for v in samples[i:i + per]:
+                av = -v if v < 0 else v
+                if av > top:
+                    top = av
+            peaks.append(top)
+        if peaks:
+            scale = max(peaks)
+            if scale > 0:
+                peaks = [min(1.0, (p / scale) ** 0.7) for p in peaks]
+            return peaks
+
+    # Fallback: deterministic content-energy profile from the raw bytes
+    try:
+        size = Path(filepath).stat().st_size
+        n_cols = 2048
+        step = max(1, size // n_cols)
+        peaks = []
+        with open(filepath, 'rb') as f:
+            for c in range(n_cols):
+                f.seek(min(c * step, max(0, size - 1)))
+                chunk = f.read(512)
+                if not chunk:
+                    peaks.append(0.0)
+                    continue
+                e = 0
+                for b in chunk:
+                    d = b - 128
+                    e += -d if d < 0 else d
+                peaks.append(e / len(chunk) / 128.0)
+        scale = max(peaks) if peaks else 0.0
+        if scale > 0:
+            peaks = [min(1.0, (p / scale) ** 0.7) for p in peaks]
+        return peaks
+    except Exception:
+        return []
+
+
+class _WaveformWorker(QThread):
+    """Decode one track's amplitude profile in the background."""
+    done = pyqtSignal(int, list)  # (generation, peaks)
+
+    def __init__(self, generation, filepath):
+        super().__init__()
+        self._generation = generation
+        self._filepath = filepath
+
+    def run(self):
+        peaks = compute_waveform_peaks(self._filepath)
+        self.done.emit(self._generation, peaks)
+
+
+class WaveformVisualizer(QWidget):
+    """Realtime waveform display for the playing track.
+
+    Low-resource design: the track's amplitude profile is decoded ONCE in a
+    background thread and cached as a plain list of floats. Each frame draws
+    only the ~260 visible columns as two antialiased polygons (played/accent,
+    upcoming/dim) — no per-frame decoding and no per-frame bitmap
+    generation. Vertex positions are sub-pixel floats, so the scroll is
+    perfectly smooth (QPainter rounds fractional *image* blits, but
+    antialiased vector geometry honors the fraction). A 16 ms timer (near
+    60 FPS) runs only while audio is actually playing. The player's coarse,
+    slightly late position reports are absorbed by a short easing ramp
+    instead of snapping, so the motion never jerks.
+    """
+    HEIGHT = 44
+    # Tunable knob — sets BOTH the horizontal resolution and the scroll
+    # speed: N waveform columns per second of audio, i.e. the display
+    # scrolls at N pixels/second and shows (width / N) seconds of context.
+    #   60  -> slow, ~4.3 s visible    120 -> 2x (default)    240 -> 4x
+    COLS_PER_SECOND = 120
+    PLAYHEAD_RATIO = 0.72
+
+    BG_COLOR = QColor('#1b1b1b')
+    BORDER_COLOR = QColor('#3d3d3d')
+    ACCENT_COLOR = QColor('#ffd700')
+    DIM_COLOR = QColor('#555555')
+    PLACEHOLDER_COLOR = QColor('#333333')
+    PLAYHEAD_COLOR = QColor('#ffffff')
+
+    _EASE_MS = 300.0          # report corrections spread over this time
+    _SNAP_THRESHOLD_MS = 1500.0  # larger discontinuities (seeks) snap
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(self.HEIGHT)
+        self._generation = 0
+        self._track_path = None
+        self._peaks: List[float] = []
+        self._worker = None
+        self._playing = False
+        self._anchor_pos = 0.0    # ms, base position
+        self._anchor_time = 0.0   # clock ms of the anchor
+        self._offset = 0.0        # ms, eased correction applied
+        self._target_offset = 0.0  # ms, correction to ease towards
+        self._last_tick = 0.0
+        self._clock = QElapsedTimer()
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        self._clock.start()
+        self._last_tick = self._clock.elapsed()
+
+    # ---------------------------------------------------------------- API
+    def set_track(self, filepath):
+        """Start (or keep) showing the waveform for this file."""
+        filepath = Path(filepath)
+        if filepath == self._track_path:
+            return
+        self._track_path = filepath
+        self._generation += 1
+        self._peaks = []
+        self._anchor_pos = 0.0
+        self._anchor_time = self._clock.elapsed()
+        self._offset = 0.0
+        self._target_offset = 0.0
+        if self._worker is not None:
+            self._worker.wait(2000)
+        self._worker = _WaveformWorker(self._generation, filepath)
+        self._worker.done.connect(self._on_peaks_ready)
+        self._worker.start()
+        self.update()
+
+    def clear(self):
+        """Reset to the no-track placeholder state."""
+        self._track_path = None
+        self._generation += 1
+        self._peaks = []
+        self._playing = False
+        self._timer.stop()
+        self.update()
+
+    def set_playing(self, playing: bool):
+        """Start/stop the animation timer with the playback state."""
+        if playing == self._playing:
+            return
+        self._playing = playing
+        if playing and self._peaks:
+            self._last_tick = self._clock.elapsed()
+            self._timer.start()
+        else:
+            self._timer.stop()
+        self.update()
+
+    def note_position(self, pos_ms: int):
+        """Feed a player position report (from positionChanged).
+
+        While playing, reports are coarse and arrive late, so the error
+        versus the locally extrapolated position is eased in over
+        _EASE_MS instead of snapping — that is what keeps the scroll
+        jerk-free. Big discontinuities (seeks) snap immediately.
+        """
+        now = self._clock.elapsed()
+        if self._playing:
+            err = float(pos_ms) - self._current_position()
+            if abs(err) > self._SNAP_THRESHOLD_MS:
+                self._anchor_pos = float(pos_ms)
+                self._anchor_time = now
+                self._offset = 0.0
+                self._target_offset = 0.0
+            else:
+                self._target_offset += max(
+                    -self._SNAP_THRESHOLD_MS,
+                    min(self._SNAP_THRESHOLD_MS, err))
+        else:
+            self._anchor_pos = float(pos_ms)
+            self._anchor_time = now
+            self._offset = 0.0
+            self._target_offset = 0.0
+        if not self._playing or not self._timer.isActive():
+            self.update()
+
+    # ---------------------------------------------------------- internals
+    def _on_peaks_ready(self, generation, peaks):
+        if generation != self._generation or not peaks:
+            return
+        self._peaks = peaks
+        if self._playing:
+            self._timer.start()
+        self.update()
+
+    def _current_position(self):
+        """Playback position in ms: local extrapolation (linear between the
+        player's coarse reports) plus the eased correction."""
+        pos = self._anchor_pos
+        if self._playing:
+            pos += self._clock.elapsed() - self._anchor_time
+        pos += self._offset
+        return max(0.0, pos)
+
+    def _tick(self):
+        now = self._clock.elapsed()
+        dt = now - self._last_tick
+        self._last_tick = now
+        if dt > 0:
+            k = min(1.0, dt / self._EASE_MS)
+            self._offset += (self._target_offset - self._offset) * k
+        self.update()
+
+    def _band(self, painter, c_start, c_end, pf, phx, mid, scale, color):
+        """Draw one played/upcoming band as a mirrored antialiased polygon.
+        Vertices sit at sub-pixel x positions for smooth scrolling."""
+        if c_end < c_start:
+            return
+        cols = []
+        peaks = self._peaks
+        for c in range(c_start, c_end + 1):
+            a = peaks[c] * scale
+            if a < 0.5:
+                a = 0.5
+            cols.append((phx + c - pf, a))
+        poly = QPolygonF()
+        for x, a in cols:
+            poly.append(QPointF(x, mid - a))
+        for x, a in reversed(cols):
+            poly.append(QPointF(x, mid + a))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawPolygon(poly)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+        h = self.height()
+        painter.fillRect(0, 0, w, h, self.BG_COLOR)
+
+        if not self._peaks:
+            # placeholder: flat line across the middle
+            painter.fillRect(0, h // 2, w, 1, self.PLACEHOLDER_COLOR)
+            painter.fillRect(0, h - 1, w, 1, self.BORDER_COLOR)
+            painter.end()
+            return
+
+        total = len(self._peaks)
+        phx = int(w * self.PLAYHEAD_RATIO)
+        mid = h / 2.0
+        scale = h / 2.0 - 2
+        pf = self._current_position() / 1000.0 * self.COLS_PER_SECOND
+        if pf > total:
+            pf = float(total)
+
+        c0 = max(0, int(pf - phx))
+        c1 = min(total - 1, int(pf - phx + w) + 1)
+        ph_col = int(pf)  # last column at/behind the playhead
+
+        self._band(painter, c0, min(c1, ph_col), pf, phx, mid, scale,
+                   self.ACCENT_COLOR)
+        self._band(painter, ph_col + 1, c1, pf, phx, mid, scale,
+                   self.DIM_COLOR)
+
+        # playhead marker + bottom border (fillRect keeps them crisp —
+        # antialiased 1px lines at integer coords would blur to 50% gray)
+        painter.fillRect(phx, 0, 1, h, self.PLAYHEAD_COLOR)
+        painter.fillRect(0, h - 1, w, 1, self.BORDER_COLOR)
+        painter.end()
+
+
 class TrackInfoPanel(QWidget):
     """Right-side panel that displays the current track's metadata.
 
     Part of the main window, docked to the right of the main content behind
     a thin vertical separator (the menu bar row only covers the left column,
-    so it stops at that separator). Shows cover art, title, artist, album,
-    year and genre when present in the file metadata. The content is
-    vertically centered in the panel.
+    so it stops at that separator). A waveform visualizer spans the full
+    width at the top; below it, cover art, title, artist, album, year and
+    genre (when present in the file metadata) are vertically centered.
     """
     WIDTH = 260
     ART_SIZE = 220
@@ -915,9 +1202,19 @@ class TrackInfoPanel(QWidget):
 
         self.setFixedWidth(self.WIDTH)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Waveform visualizer spanning the entire width of the panel
+        self.waveform = WaveformVisualizer(self)
+        outer.addWidget(self.waveform)
+
+        inner = QWidget(self)
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(6)
+        outer.addWidget(inner)
 
         layout.addStretch(1)
 
@@ -972,6 +1269,7 @@ class TrackInfoPanel(QWidget):
     def set_track(self, filepath: Path):
         """Populate the panel from the file's metadata."""
         self.current_path = filepath
+        self.waveform.set_track(filepath)
         info = read_track_info(filepath)
 
         self.title_label.setText(info['title'] or filepath.stem)
@@ -1000,6 +1298,7 @@ class TrackInfoPanel(QWidget):
     def clear(self):
         """Reset the panel to the 'no track' state."""
         self.current_path = None
+        self.waveform.clear()
         self.title_label.setText('No track loaded')
         self.title_label.setVisible(True)
         for lbl in (self.artist_label, self.album_label, self.extra_label):
@@ -1071,6 +1370,7 @@ class Musibisk(QMainWindow):
         self.player.positionChanged.connect(self.update_position)
         self.player.durationChanged.connect(self.update_duration)
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
+        self.player.playbackStateChanged.connect(self.on_playback_state_changed)
         
         # Setup UI
         self.init_ui()
@@ -2150,6 +2450,14 @@ class Musibisk(QMainWindow):
         """Update position display"""
         self.seek_slider.setValue(position)
         self.time_label.setText(self.format_time(position))
+        if self.info_panel is not None:
+            self.info_panel.waveform.note_position(position)
+    
+    def on_playback_state_changed(self, state):
+        """Run/pause the waveform animation with the playback state"""
+        if self.info_panel is not None:
+            self.info_panel.waveform.set_playing(
+                state == QMediaPlayer.PlaybackState.PlayingState)
     
     def update_duration(self, duration):
         """Update duration display"""
