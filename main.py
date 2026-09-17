@@ -6,12 +6,14 @@ Musibisk - A sleek, minimal music player with directory monitoring
 import sys
 import json
 import os
+import queue
 from pathlib import Path
 from typing import List, Optional
 from enum import Enum
 import base64
 import time
 from datetime import datetime
+from urllib.parse import urlsplit
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -19,7 +21,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QDialog, QFormLayout, QSpinBox,
     QDialogButtonBox, QFrame, QDial, QTableWidget, QTableWidgetItem,
     QHeaderView, QComboBox, QStyledItemDelegate, QStyleOptionViewItem,
-    QStyle
+    QStyle, QCheckBox, QLineEdit
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QUrl, QThread, pyqtSignal, QObject, QByteArray,
@@ -33,7 +35,42 @@ from PyQt6.QtGui import (
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import mutagen
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
+try:
+    from cryptography.fernet import Fernet
+except ImportError:
+    Fernet = None
 from resources import ICON_PNG_BASE64, BITMAP_FONT
+
+# Hard-coded key used to obfuscate secrets at rest in config.json. This is NOT
+# a security boundary (the key ships with the app); it just keeps values like
+# the sync password from sitting in the config file as plain text.
+_CONFIG_SECRET_KEY = b"TdkrPmF6emqbeZzi5CcZr5_6Hrm2m76A6Sck7rSSmfM="
+
+
+def encrypt_secret(value: str) -> str:
+    """Obfuscate a secret for storage in the config file.
+
+    Returns the value unchanged when empty or when no cipher is available.
+    """
+    if not value or Fernet is None:
+        return value
+    return Fernet(_CONFIG_SECRET_KEY).encrypt(value.encode()).decode()
+
+
+def decrypt_secret(value: str) -> str:
+    """Reverse encrypt_secret. Falls back to the raw value on any error, so
+    legacy plain-text config values keep working (and get re-encrypted on
+    the next save)."""
+    if not value or Fernet is None:
+        return value
+    try:
+        return Fernet(_CONFIG_SECRET_KEY).decrypt(value.encode()).decode()
+    except Exception:
+        return value
 
 class LoopMode(Enum):
     NO_LOOP = 0
@@ -120,6 +157,170 @@ class FileWatcherThread(QThread):
         self.quit()
 
 
+def parse_sync_url(url: str):
+    """Parse a sync server URL like 'ssh://host:22/path/to/music'.
+
+    Returns (host, port, path, user). Port defaults to 22, path to '/'.
+    The scheme may be omitted; an optional 'user@' prefix is accepted.
+    """
+    url = (url or '').strip()
+    if not url:
+        return ('', 22, '/', '')
+    if '://' not in url:
+        url = 'ssh://' + url
+    parts = urlsplit(url)
+    host = parts.hostname or ''
+    port = parts.port or 22
+    path = parts.path or '/'
+    user = parts.username or ''
+    return (host, port, path, user)
+
+
+class SyncWorker(QThread):
+    """Background worker that syncs files to a remote SSH server.
+
+    Operations (upload/remove) are placed on a queue and processed one at
+    a time in this thread, so they never block the UI and never stack up
+    on top of each other. The SSH connection is kept alive between
+    operations and re-established automatically after failures.
+    """
+    log_message = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.queue = queue.Queue()
+        self.enabled = False
+        self.host = ''
+        self.port = 22
+        self.remote_dir = '/'
+        self.user = ''
+        self.auth = 'key'
+        self.key_file = ''
+        self.password = ''
+        self._client = None
+        self._sftp = None
+
+    def update_config(self, enabled, url, user, auth, key_file, password):
+        """Apply new settings. Safe to call from the main thread."""
+        host, port, path, url_user = parse_sync_url(url)
+        self.enabled = enabled
+        self.host = host
+        self.port = port
+        self.remote_dir = path
+        self.user = user or url_user
+        self.auth = auth
+        self.key_file = key_file
+        self.password = password
+        if not enabled:
+            self._disconnect()
+
+    def enqueue_upload(self, local_path: Path, remote_name: str):
+        """Queue an upload of local_path to remote_dir/remote_name."""
+        if not self.enabled:
+            return
+        self.queue.put(('upload', str(local_path), remote_name))
+
+    def enqueue_remove(self, remote_name: str):
+        """Queue a removal of remote_dir/remote_name (if it exists)."""
+        if not self.enabled:
+            return
+        self.queue.put(('remove', None, remote_name))
+
+    def _disconnect(self):
+        try:
+            if self._sftp is not None:
+                self._sftp.close()
+        except Exception:
+            pass
+        self._sftp = None
+        try:
+            if self._client is not None:
+                self._client.close()
+        except Exception:
+            pass
+        self._client = None
+
+    def _ensure_connected(self):
+        """Open (or reuse) the SSH connection to the remote server."""
+        if self._sftp is not None:
+            return
+        if paramiko is None:
+            raise RuntimeError("paramiko is not installed; add it to run remote sync")
+        if not self.host:
+            raise RuntimeError("No sync server configured")
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        kwargs = dict(
+            hostname=self.host,
+            port=self.port,
+            username=self.user,
+            timeout=15,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+        if self.auth == 'key' and self.key_file:
+            kwargs['key_filename'] = self.key_file
+        elif self.password:
+            kwargs['password'] = self.password
+        client.connect(**kwargs)
+        self._client = client
+        self._sftp = client.open_sftp()
+
+    def _remote_path(self, name: str) -> str:
+        return f"{self.remote_dir.rstrip('/')}/{name}"
+
+    def _ensure_remote_dir(self, path: str):
+        """Create the remote directory tree if it does not exist yet."""
+        current = ''
+        for part in [p for p in path.split('/') if p]:
+            current = f"{current}/{part}"
+            try:
+                self._sftp.stat(current)
+            except IOError:
+                try:
+                    self._sftp.mkdir(current)
+                except IOError:
+                    pass  # exists or not creatable; put() will report it
+
+    def run(self):
+        while True:
+            op = self.queue.get()
+            if op is None:
+                break
+            kind, local_path, name = op
+            try:
+                self._ensure_connected()
+                sftp = self._sftp  # local ref in case config changes mid-op
+                if sftp is None:
+                    raise RuntimeError("Connection lost")
+                remote = self._remote_path(name)
+                if kind == 'upload':
+                    if not os.path.exists(local_path):
+                        raise FileNotFoundError(f"Local file missing: {local_path}")
+                    self._ensure_remote_dir(self.remote_dir)
+                    sftp.put(local_path, remote)
+                    self.log_message.emit(f"Synced '{name}' to remote")
+                else:
+                    try:
+                        sftp.stat(remote)
+                        sftp.remove(remote)
+                        self.log_message.emit(f"Removed '{name}' from remote")
+                    except IOError:
+                        self.log_message.emit(f"'{name}' not on remote, nothing to remove")
+            except Exception as e:
+                self.log_message.emit(f"Sync error: {e}")
+                self._disconnect()
+            finally:
+                self.queue.task_done()
+
+    def stop(self):
+        """Queue the stop sentinel and wait for the worker to finish."""
+        self.queue.put(None)
+        self.wait(3000)
+        self._disconnect()
+
+
 class PlaylistDelegate(QStyledItemDelegate):
     """Custom delegate to highlight the currently playing song"""
     
@@ -164,29 +365,79 @@ class PlaylistDelegate(QStyledItemDelegate):
 
 class SettingsDialog(QDialog):
     """Settings dialog for configuring Musibisk"""
-    
-    def __init__(self, parent=None, initial_songs=50, play_order=PlayOrder.OLDEST_TO_NEWEST):
+
+    def __init__(self, parent=None, initial_songs=50, play_order=PlayOrder.OLDEST_TO_NEWEST,
+                 sync_enabled=False, sync_url='', sync_user='', sync_auth='key',
+                 sync_key_file='', sync_password=''):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setFixedSize(300, 120)
-        
+        self.setFixedSize(400, 348)
+
         layout = QFormLayout(self)
-        
+
         self.songs_spinbox = QSpinBox()
         self.songs_spinbox.setRange(1, 1000)
         self.songs_spinbox.setValue(initial_songs)
         self.songs_spinbox.setSuffix(" songs")
-        
+
         layout.addRow("Initial playlist size:", self.songs_spinbox)
-        
+
         # Play order dropdown
         self.play_order_combo = QComboBox()
         self.play_order_combo.addItem("Oldest to Newest", PlayOrder.OLDEST_TO_NEWEST)
         self.play_order_combo.addItem("Newest to Oldest", PlayOrder.NEWEST_TO_OLDEST)
         self.play_order_combo.setCurrentIndex(play_order.value)
-        
+
         layout.addRow("Play order:", self.play_order_combo)
-        
+
+        # Remote sync section
+        sync_header = QLabel("Remote sync")
+        sync_header.setStyleSheet("font-weight: bold; color: #E8D4A0; padding-top: 8px;")
+        layout.addRow(sync_header)
+
+        self.sync_check = QCheckBox("Enable remote sync")
+        self.sync_check.setChecked(sync_enabled)
+
+        layout.addRow(self.sync_check)
+
+        self.sync_url_edit = QLineEdit(sync_url)
+        self.sync_url_edit.setPlaceholderText("ssh://192.168.1.100:22/path/to/music")
+
+        layout.addRow("Server:", self.sync_url_edit)
+
+        self.sync_user_edit = QLineEdit(sync_user)
+
+        layout.addRow("User:", self.sync_user_edit)
+
+        self.sync_auth_combo = QComboBox()
+        self.sync_auth_combo.addItem("SSH key file", 'key')
+        self.sync_auth_combo.addItem("Password", 'password')
+        self.sync_auth_combo.setCurrentIndex(0 if sync_auth == 'key' else 1)
+        self.sync_auth_combo.currentIndexChanged.connect(self._update_auth_fields)
+
+        layout.addRow("Auth:", self.sync_auth_combo)
+
+        self.sync_key_file_edit = QLineEdit(sync_key_file)
+        self.sync_key_file_edit.setReadOnly(True)
+        self.sync_key_file_edit.setPlaceholderText("Path to SSH private key (e.g. ~/.ssh/id_ed25519)")
+        key_file_row = QWidget()
+        key_file_layout = QHBoxLayout(key_file_row)
+        key_file_layout.setContentsMargins(0, 0, 0, 0)
+        key_file_layout.addWidget(self.sync_key_file_edit)
+        browse_button = QPushButton("Browse...")
+        browse_button.clicked.connect(self.browse_key_file)
+        key_file_layout.addWidget(browse_button)
+        self.key_file_row = key_file_row
+
+        layout.addRow("Key file:", self.key_file_row)
+
+        self.sync_password_edit = QLineEdit(sync_password)
+        self.sync_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+
+        layout.addRow("Password:", self.sync_password_edit)
+
+        self._update_auth_fields()
+
         # Buttons
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -194,8 +445,23 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
-        
+
         self.apply_style()
+
+    def browse_key_file(self):
+        """Open a file dialog to pick an SSH private key file"""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Select SSH Key File", str(Path.home()),
+            "Key Files (*.pem *.ppk *.key id_rsa id_ecdsa id_ed25519);;All Files (*)"
+        )
+        if filepath:
+            self.sync_key_file_edit.setText(filepath)
+
+    def _update_auth_fields(self):
+        """Show only the fields relevant to the selected auth method"""
+        is_key = self.sync_auth_combo.currentData() == 'key'
+        self.key_file_row.setVisible(is_key)
+        self.sync_password_edit.setVisible(not is_key)
     
     def apply_style(self):
         """Apply dark theme to dialog"""
@@ -207,12 +473,27 @@ class SettingsDialog(QDialog):
             QLabel {
                 color: #ffffff;
             }
-            QSpinBox, QComboBox {
+            QSpinBox, QComboBox, QLineEdit {
                 background-color: #2d2d2d;
                 color: #ffffff;
                 border: 1px solid #3d3d3d;
                 border-radius: 4px;
                 padding: 4px;
+            }
+            QCheckBox {
+                color: #ffffff;
+                spacing: 6px;
+            }
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                background-color: #2d2d2d;
+                border: 1px solid #3d3d3d;
+                border-radius: 3px;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #4d9eff;
+                border: 1px solid #4d9eff;
             }
             QSpinBox::up-button, QSpinBox::down-button {
                 background-color: #3d3d3d;
@@ -253,10 +534,28 @@ class SettingsDialog(QDialog):
     def get_songs_count(self):
         """Return the selected number of songs"""
         return self.songs_spinbox.value()
-    
+
     def get_play_order(self):
         """Return the selected play order"""
         return self.play_order_combo.currentData()
+
+    def get_sync_enabled(self):
+        return self.sync_check.isChecked()
+
+    def get_sync_url(self):
+        return self.sync_url_edit.text().strip()
+
+    def get_sync_user(self):
+        return self.sync_user_edit.text().strip()
+
+    def get_sync_auth(self):
+        return self.sync_auth_combo.currentData()
+
+    def get_sync_key_file(self):
+        return self.sync_key_file_edit.text().strip()
+
+    def get_sync_password(self):
+        return self.sync_password_edit.text()
 
 
 class Musibisk(QMainWindow):
@@ -269,7 +568,7 @@ class Musibisk(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Musibisk")
-        self.setFixedSize(450, 400)
+        self.setFixedSize(530, 400)
         
         # State
         self.playlist: List[Path] = []
@@ -279,6 +578,15 @@ class Musibisk(QMainWindow):
         self.target_directory: Optional[Path] = None
         self.watcher_thread: Optional[FileWatcherThread] = None
         self.initial_songs_count: int = 50
+        
+        # Remote sync state
+        self.sync_enabled: bool = False
+        self.sync_url: str = ''
+        self.sync_user: str = ''
+        self.sync_auth: str = 'key'
+        self.sync_key_file: str = ''
+        self.sync_password: str = ''
+        self.sync_worker: Optional[SyncWorker] = None
         
         # Delete button state
         self.delete_click_count = 0
@@ -306,6 +614,19 @@ class Musibisk(QMainWindow):
         # Setup global hotkeys
         self.setup_global_hotkeys()
         
+        # Start background sync worker and apply loaded sync settings
+        self.sync_worker = SyncWorker()
+        self.sync_worker.log_message.connect(self.on_sync_log)
+        self.sync_worker.start()
+        self.apply_sync_config()
+        
+        # Compensate for font-dependent glyph vertical offsets
+        self.center_button_glyph(self.prev_button)
+        self.center_button_glyph(self.play_pause_button)
+        self.center_button_glyph(self.next_button)
+        self.center_button_glyph(self.loop_button)
+        self.center_button_glyph(self.delete_button)
+    
     def init_ui(self):
         """Initialize the user interface"""
         # Menu bar
@@ -315,6 +636,14 @@ class Musibisk(QMainWindow):
         select_folder_action = QAction("Select Target Folder", self)
         select_folder_action.triggered.connect(self.select_folder)
         file_menu.addAction(select_folder_action)
+        
+        file_menu.addSeparator()
+        
+        self.sync_menu_action = QAction("Remote Sync", self)
+        self.sync_menu_action.setCheckable(True)
+        self.sync_menu_action.setToolTip("Toggle syncing saved songs to the remote server")
+        self.sync_menu_action.triggered.connect(self.toggle_remote_sync)
+        file_menu.addAction(self.sync_menu_action)
         
         file_menu.addSeparator()
         
@@ -344,8 +673,8 @@ class Musibisk(QMainWindow):
         
         # Playlist view - now using QTableWidget
         self.playlist_widget = QTableWidget()
-        self.playlist_widget.setColumnCount(2)
-        self.playlist_widget.setHorizontalHeaderLabels(["Song", "Modified"])
+        self.playlist_widget.setColumnCount(3)
+        self.playlist_widget.setHorizontalHeaderLabels(["Song", "Length", "Modified"])
         self.playlist_widget.setMaximumHeight(180)
         self.playlist_widget.setStyleSheet(f"font-family: {BitmapFontFamily};")
         self.playlist_widget.cellDoubleClicked.connect(self.on_playlist_item_clicked)
@@ -361,7 +690,9 @@ class Musibisk(QMainWindow):
         header = self.playlist_widget.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.playlist_widget.setColumnWidth(1, 150)  # Fixed width for timestamp column
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.playlist_widget.setColumnWidth(1, 60)   # Fixed width for length column
+        self.playlist_widget.setColumnWidth(2, 150)  # Fixed width for timestamp column
         
         layout.addWidget(self.playlist_widget)
         
@@ -477,6 +808,9 @@ class Musibisk(QMainWindow):
         controls_layout.addStretch()
         
         layout.addLayout(controls_layout)
+        
+        # Status bar (shows sync progress and other transient messages)
+        self.statusBar().setStyleSheet("background-color: #1e1e1e; color: #888; font-size: 10px;")
     
     def apply_style(self):
         """Apply dark theme styling"""
@@ -628,6 +962,50 @@ class Musibisk(QMainWindow):
             }
         """)
     
+    def center_button_glyph(self, button: QPushButton):
+        """Nudge a button's text so the rendered glyph is vertically centered.
+
+        Emoji glyphs (e.g. from Noto Color Emoji) and text glyphs (e.g. from
+        DejaVu Sans) are placed at different heights within the font's em box,
+        so the same button text can appear slightly high or low depending on
+        which font provides the glyph. Measure the rendered glyph's bounding
+        box and add padding-top to compensate for any upward misalignment.
+        """
+        text = button.text()
+        if not text:
+            return
+        
+        rect = button.contentsRect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        
+        pixmap = QPixmap(rect.size())
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setFont(button.font())
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+        painter.end()
+        
+        image = pixmap.toImage()
+        dpr = pixmap.devicePixelRatio()
+        min_row = max_row = None
+        for row in range(image.height()):
+            for col in range(image.width()):
+                if image.pixelColor(col, row).alpha() > 20:
+                    if min_row is None:
+                        min_row = row
+                    max_row = row
+                    break
+        if min_row is None:
+            return
+        
+        offset = ((min_row + max_row) / 2) / dpr - rect.height() / 2
+        if offset >= -0.75:
+            return  # glyph is not meaningfully above center
+        
+        padding = int(round(-2 * offset))
+        button.setStyleSheet(f"{button.styleSheet()} padding-top: {padding}px;")
+    
     def setup_global_hotkeys(self):
         """Setup global hotkeys for media control"""
         # Note: PyQt6 doesn't have native global hotkeys
@@ -675,11 +1053,28 @@ class Musibisk(QMainWindow):
     
     def show_settings(self):
         """Show settings dialog"""
-        dialog = SettingsDialog(self, self.initial_songs_count, self.play_order)
+        dialog = SettingsDialog(
+            self,
+            self.initial_songs_count,
+            self.play_order,
+            sync_enabled=self.sync_enabled,
+            sync_url=self.sync_url,
+            sync_user=self.sync_user,
+            sync_auth=self.sync_auth,
+            sync_key_file=self.sync_key_file,
+            sync_password=self.sync_password,
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             old_play_order = self.play_order
             self.initial_songs_count = dialog.get_songs_count()
             self.play_order = dialog.get_play_order()
+            self.sync_enabled = dialog.get_sync_enabled()
+            self.sync_url = dialog.get_sync_url()
+            self.sync_user = dialog.get_sync_user()
+            self.sync_auth = dialog.get_sync_auth()
+            self.sync_key_file = dialog.get_sync_key_file()
+            self.sync_password = dialog.get_sync_password()
+            self.apply_sync_config()
             self.save_config()
             
             # Reload playlist if directory is set
@@ -808,10 +1203,21 @@ class Musibisk(QMainWindow):
             return dt.strftime("%H:%M:%S %m/%d/%Y")
         except:
             return "Unknown"
+
+    def get_song_length(self, filepath: Path) -> str:
+        """Get formatted length (M:SS) of an audio file"""
+        try:
+            audio = mutagen.File(filepath)
+            if audio and audio.info:
+                return self.format_time(int(audio.info.length * 1000))
+        except:
+            pass
+        return "?"
     
     def add_to_playlist_widget(self, filepath: Path):
         """Add a song to the playlist widget (at the end)"""
         song_name = self.get_song_name(filepath)
+        length = self.get_song_length(filepath)
         timestamp = self.get_formatted_timestamp(filepath)
         
         row = self.playlist_widget.rowCount()
@@ -823,15 +1229,22 @@ class Musibisk(QMainWindow):
         song_item.setFlags(song_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.playlist_widget.setItem(row, 0, song_item)
         
+        # Length column
+        length_item = QTableWidgetItem(length)
+        length_item.setForeground(Qt.GlobalColor.gray)
+        length_item.setFlags(length_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.playlist_widget.setItem(row, 1, length_item)
+        
         # Timestamp column
         time_item = QTableWidgetItem(timestamp)
         time_item.setForeground(Qt.GlobalColor.gray)
         time_item.setFlags(time_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.playlist_widget.setItem(row, 1, time_item)
+        self.playlist_widget.setItem(row, 2, time_item)
     
     def add_to_playlist_widget_at_top(self, filepath: Path):
         """Add a song to the playlist widget at the top"""
         song_name = self.get_song_name(filepath)
+        length = self.get_song_length(filepath)
         timestamp = self.get_formatted_timestamp(filepath)
         
         self.playlist_widget.insertRow(0)
@@ -842,11 +1255,17 @@ class Musibisk(QMainWindow):
         song_item.setFlags(song_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.playlist_widget.setItem(0, 0, song_item)
         
+        # Length column
+        length_item = QTableWidgetItem(length)
+        length_item.setForeground(Qt.GlobalColor.gray)
+        length_item.setFlags(length_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.playlist_widget.setItem(0, 1, length_item)
+        
         # Timestamp column
         time_item = QTableWidgetItem(timestamp)
         time_item.setForeground(Qt.GlobalColor.gray)
         time_item.setFlags(time_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.playlist_widget.setItem(0, 1, time_item)
+        self.playlist_widget.setItem(0, 2, time_item)
     
     def on_playlist_item_clicked(self, row: int, column: int):
         """Handle playlist item double-click"""
@@ -926,6 +1345,50 @@ class Musibisk(QMainWindow):
         """Handle volume slider value change"""
         self.audio_output.setVolume(value / 100.0)
     
+    def apply_sync_config(self):
+        """Push the current sync settings into the background worker"""
+        if self.sync_worker is None:
+            return
+        self.sync_worker.update_config(
+            self.sync_enabled, self.sync_url, self.sync_user,
+            self.sync_auth, self.sync_key_file, self.sync_password
+        )
+        if self.sync_menu_action is not None:
+            self.sync_menu_action.setChecked(self.sync_enabled)
+    
+    def toggle_remote_sync(self, checked: bool):
+        """Toggle remote sync on or off (from the File menu)"""
+        self.sync_enabled = checked
+        self.apply_sync_config()
+        self.save_config()
+        self.statusBar().showMessage(
+            "Remote sync enabled" if checked else "Remote sync disabled", 3000
+        )
+    
+    def on_sync_log(self, message: str):
+        """Show sync progress/errors in the status bar"""
+        self.statusBar().showMessage(message, 5000)
+    
+    def get_remote_name(self, filepath: Path) -> str:
+        """Remote storage name for a song.
+
+        The local '*_' save marker is a UI detail, so on the remote server
+        the song is stored under its plain name. This keeps the remote name
+        stable across save/unsave/delete cycles.
+        """
+        name = filepath.name
+        return name[2:] if name.startswith('*_') else name
+    
+    def sync_upload(self, filepath: Path, remote_name: str):
+        """Queue an upload of the given file to the remote server"""
+        if self.sync_worker is not None:
+            self.sync_worker.enqueue_upload(filepath, remote_name)
+    
+    def sync_remove(self, remote_name: str):
+        """Queue a removal of the given remote file (if it exists)"""
+        if self.sync_worker is not None:
+            self.sync_worker.enqueue_remove(remote_name)
+    
     def toggle_save_song(self):
         """Toggle the save status of the current song"""
         if self.current_index < 0 or self.current_index >= len(self.playlist):
@@ -962,6 +1425,12 @@ class Musibisk(QMainWindow):
             
             # Update save button appearance
             self.update_save_button()
+            
+            # Remote sync: upload when saving, remove when unsaving
+            if self.is_song_saved(new_path):
+                self.sync_upload(new_path, self.get_remote_name(new_path))
+            else:
+                self.sync_remove(self.get_remote_name(new_path))
             
         except Exception as e:
             print(f"Error renaming file: {e}")
@@ -1047,6 +1516,9 @@ class Musibisk(QMainWindow):
             
             # Delete the file
             current_file.unlink()
+            
+            # Remote sync: remove from remote server if it exists
+            self.sync_remove(self.get_remote_name(current_file))
             
             # Remove from playlist
             del self.playlist[self.current_index]
@@ -1222,6 +1694,24 @@ class Musibisk(QMainWindow):
             
             if 'initial_songs_count' in config:
                 self.initial_songs_count = config['initial_songs_count']
+            
+            if 'sync_enabled' in config:
+                self.sync_enabled = bool(config['sync_enabled'])
+            
+            if 'sync_url' in config:
+                self.sync_url = config['sync_url']
+            
+            if 'sync_user' in config:
+                self.sync_user = config['sync_user']
+            
+            if 'sync_auth' in config:
+                self.sync_auth = config['sync_auth']
+            
+            if 'sync_key_file' in config:
+                self.sync_key_file = config['sync_key_file']
+            
+            if 'sync_password' in config:
+                self.sync_password = decrypt_secret(config['sync_password'])
                 
         except Exception as e:
             print(f"Error loading config: {e}")
@@ -1234,7 +1724,13 @@ class Musibisk(QMainWindow):
             'loop_mode': self.loop_mode.value,
             'play_order': self.play_order.value,
             'volume': self.audio_output.volume(),
-            'initial_songs_count': self.initial_songs_count
+            'initial_songs_count': self.initial_songs_count,
+            'sync_enabled': self.sync_enabled,
+            'sync_url': self.sync_url,
+            'sync_user': self.sync_user,
+            'sync_auth': self.sync_auth,
+            'sync_key_file': self.sync_key_file,
+            'sync_password': encrypt_secret(self.sync_password)
         }
         
         if self.target_directory:
@@ -1275,6 +1771,10 @@ class Musibisk(QMainWindow):
             self.watcher_thread.quit()
             # Don't wait indefinitely - give it 500ms max
             self.watcher_thread.wait(500)
+        
+        # Stop the background sync worker
+        if self.sync_worker:
+            self.sync_worker.stop()
         
         event.accept()
 
