@@ -10,6 +10,11 @@ For every '*_*.mp3' / '*_*.flac' file in the directory (non-recursive):
        MP3  -> ID3 TXXX frame  TXXX:MUSIBISK_SAVED = '1'
        FLAC -> Vorbis Comment  MUSIBISK_SAVED = '1'
   2. the file is renamed with the leading '*_' removed
+  3. the original access/modified timestamps are restored (the tag
+     write updates the modified time, which would otherwise make every
+     converted song look brand new — Musibisk orders its playlist by
+     modified time). The created/birth time is not restored: Linux
+     gives userspace no way to set it.
 
 Files that fail tagging are left completely untouched (no rename).
 Only 'mutagen' is required:  pip install mutagen
@@ -18,6 +23,7 @@ NOTE: the tag format must stay in sync with SAVED_TAG_KEY /
 set_saved_tag / read_saved_tag in main.py.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -82,6 +88,18 @@ def read_saved_tag(filepath: Path) -> bool:
         return False
 
 
+def restore_timestamps(filepath: Path, st):
+    """Restore atime+mtime (nanosecond precision) after the tag write.
+
+    The created/birth time is deliberately not touched: on Linux it can
+    be read (statx) but there is no userspace API to set it.
+    """
+    try:
+        os.utime(filepath, ns=(st.st_atime_ns, st.st_mtime_ns))
+    except OSError as e:
+        print(f"    warning: could not restore timestamps: {e}")
+
+
 def main() -> int:
     args = sys.argv[1:]
     dry_run = '--dry-run' in args
@@ -115,16 +133,20 @@ def main() -> int:
             failures += 1
             continue
         if dry_run:
-            print(f"WOULD  {f.name} -> {new_name}  (tag 'saved')")
+            print(f"WOULD  {f.name} -> {new_name}  (tag 'saved', "
+                  f"timestamps kept)")
             continue
+        st = f.stat()  # original timestamps, before any modification
         if set_saved_tag(f):
             f.rename(target)
             tagged = read_saved_tag(target)
+            restore_timestamps(target, st)
             print(f"OK     {f.name} -> {new_name}"
                   + ("" if tagged else "  WARNING: tag not verified!"))
             if not tagged:
                 failures += 1
         else:
+            restore_timestamps(f, st)
             print(f"FAIL   {f.name}  (left untouched)")
             failures += 1
 
