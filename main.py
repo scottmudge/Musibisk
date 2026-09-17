@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QUrl, QThread, pyqtSignal, QObject, QByteArray,
-    QModelIndex
+    QModelIndex, QRect
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import (
@@ -152,6 +152,104 @@ def read_track_info(filepath) -> dict:
     return info
 
 
+# 'Saved' marker, stored as an embedded metadata tag instead of a filename
+# prefix. A dedicated user-defined key (rather than POPM) is used so the
+# marker cannot collide with rating/play-count data that other apps write:
+#   MP3      -> ID3 TXXX frame  TXXX:MUSIBISK_SAVED = '1'
+#   FLAC/OGG -> Vorbis Comment  MUSIBISK_SAVED = '1'
+#   MP4/M4A  -> freeform atom   ----:com.musibisk:saved = '1'
+SAVED_TAG_KEY = 'MUSIBISK_SAVED'
+SAVED_TAG_VALUE = '1'
+_M4A_SAVED_KEY = '----:com.musibisk:saved'
+
+
+def read_saved_tag(filepath) -> bool:
+    """Check if a file is marked as saved via its embedded metadata tag."""
+    try:
+        audio = mutagen.File(filepath)
+        if audio is None:
+            return False
+        tags = getattr(audio, 'tags', None)
+        if tags is None:
+            return False
+        if isinstance(audio, mutagen.mp3.MP3):
+            # ID3 keys are exact-match ('TXXX:MUSIBISK_SAVED'); scan for it
+            for key, frame in tags.items():
+                if key.startswith('TXXX:') and key[5:].upper() == SAVED_TAG_KEY:
+                    try:
+                        return str(frame.text[0]) == SAVED_TAG_VALUE
+                    except (ValueError, IndexError):
+                        return False
+            return False
+        if isinstance(audio, mutagen.mp4.MP4):
+            vals = tags.get(_M4A_SAVED_KEY)
+            if not vals:
+                return False
+            return bytes(vals[0]) == SAVED_TAG_VALUE.encode()
+        vals = tags.get(SAVED_TAG_KEY)  # Vorbis Comments are case-insensitive
+        if not vals:
+            return False
+        return str(vals[0]) == SAVED_TAG_VALUE
+    except Exception:
+        return False
+
+
+def set_saved_tag(filepath, saved: bool) -> bool:
+    """Mark a file as saved (or remove the mark) in its metadata.
+
+    Returns True on success.
+    """
+    try:
+        audio = mutagen.File(filepath)
+        if audio is None:
+            return False
+        if getattr(audio, 'tags', None) is None:
+            try:
+                audio.add_tags()
+            except Exception:
+                return False
+        tags = audio.tags
+        if tags is None:
+            return False
+        if isinstance(audio, mutagen.mp3.MP3):
+            from mutagen.id3 import TXXX
+            key = None
+            for k in tags.keys():
+                if k.startswith('TXXX:') and k[5:].upper() == SAVED_TAG_KEY:
+                    key = k
+                    break
+            if saved:
+                if key is not None:
+                    tags[key].text = [SAVED_TAG_VALUE]
+                else:
+                    tags.add(TXXX(encoding=3, desc=SAVED_TAG_KEY,
+                                  text=[SAVED_TAG_VALUE]))
+            elif key is not None:
+                del tags[key]
+        elif isinstance(audio, mutagen.mp4.MP4):
+            if saved:
+                tags[_M4A_SAVED_KEY] = [SAVED_TAG_VALUE.encode()]
+            else:
+                try:
+                    del tags[_M4A_SAVED_KEY]
+                except KeyError:
+                    pass
+        else:
+            # FLAC / OGG / OPUS (Vorbis Comments)
+            if saved:
+                tags[SAVED_TAG_KEY] = [SAVED_TAG_VALUE]
+            else:
+                try:
+                    del tags[SAVED_TAG_KEY]
+                except KeyError:
+                    pass
+        audio.save()
+        return True
+    except Exception as e:
+        print(f"Error setting saved tag: {e}")
+        return False
+
+
 class LoopMode(Enum):
     NO_LOOP = 0
     LOOP_PLAYLIST = 1
@@ -195,20 +293,41 @@ class FileWatcherHandler(FileSystemEventHandler):
     
     AUDIO_EXTENSIONS = {'.mp3', '.flac', '.m4a', '.wav', '.ogg', '.opus', '.aac', '.wma'}
     
-    def __init__(self, callback):
+    def __init__(self, directory: str, on_created, on_deleted):
+        # NOTE: these must not be named on_created/on_deleted — watchdog
+        # dispatches to the handler METHODS with those names.
         super().__init__()
-        self.callback = callback
+        self.directory = Path(directory)
+        self._on_created = on_created
+        self._on_deleted = on_deleted
+    
+    def _is_audio(self, path) -> bool:
+        return Path(path).suffix.lower() in self.AUDIO_EXTENSIONS
     
     def on_created(self, event):
-        if not event.is_directory:
-            ext = Path(event.src_path).suffix.lower()
-            if ext in self.AUDIO_EXTENSIONS:
-                self.callback(event.src_path)
+        if not event.is_directory and self._is_audio(event.src_path):
+            self._on_created(event.src_path)
+    
+    def on_deleted(self, event):
+        if not event.is_directory and self._is_audio(event.src_path):
+            self._on_deleted(event.src_path)
+    
+    def on_moved(self, event):
+        # A file moved out of the watched directory (e.g. 'mv' to another
+        # folder on the same filesystem) arrives as a move event rather
+        # than a delete; a rename within the directory is delete + create.
+        if event.is_directory or not self._is_audio(event.src_path):
+            return
+        self._on_deleted(event.src_path)
+        dest = Path(event.dest_path)
+        if dest.parent == self.directory and self._is_audio(dest):
+            self._on_created(event.dest_path)
 
 
 class FileWatcherThread(QThread):
     """Thread for watching directory changes"""
     file_added = pyqtSignal(str)
+    file_deleted = pyqtSignal(str)
     
     def __init__(self, directory: str):
         super().__init__()
@@ -217,7 +336,8 @@ class FileWatcherThread(QThread):
         self._stop_requested = False
         
     def run(self):
-        handler = FileWatcherHandler(self.file_added.emit)
+        handler = FileWatcherHandler(
+            self.directory, self.file_added.emit, self.file_deleted.emit)
         self.observer = Observer()
         self.observer.schedule(handler, self.directory, recursive=False)
         self.observer.start()
@@ -402,7 +522,8 @@ class SyncWorker(QThread):
 
 
 class PlaylistDelegate(QStyledItemDelegate):
-    """Custom delegate to highlight the currently playing song"""
+    """Custom delegate to highlight the currently playing song and to draw
+    the ♪ icon (gold + bold when the song is marked as saved)"""
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -412,6 +533,7 @@ class PlaylistDelegate(QStyledItemDelegate):
         self.beige_gold = QColor("#E8D4A0")
         self.white = QColor("#ffffff")
         self.gray = QColor("#888888")
+        self.saved_gold = QColor("#ffd700")
     
     def set_playing_row(self, row: int):
         """Set which row is currently playing"""
@@ -431,16 +553,56 @@ class PlaylistDelegate(QStyledItemDelegate):
         
         painter.restore()
         
+        # The song-name column is drawn manually so the ♪ icon can be
+        # colored/bolded per song
+        if index.column() == 0:
+            self._paint_song_cell(painter, option, index, is_playing)
+            return
+        
         modified_option = QStyleOptionViewItem(option)
         if is_playing:
             modified_option.palette.setColor(modified_option.palette.ColorRole.Text, self.beige_gold)
         else:
-            if index.column() == 0:
-                modified_option.palette.setColor(modified_option.palette.ColorRole.Text, self.white)
-            else:
-                modified_option.palette.setColor(modified_option.palette.ColorRole.Text, self.gray)
+            modified_option.palette.setColor(modified_option.palette.ColorRole.Text, self.gray)
         
         super().paint(painter, modified_option, index)
+    
+    def _paint_song_cell(self, painter: QPainter, option: QStyleOptionViewItem,
+                         index: QModelIndex, is_playing: bool):
+        """Draw '♪ <name>' for the song column; the ♪ is gold + bold when
+        the song is marked as saved."""
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or '')
+        saved = bool(index.data(Qt.ItemDataRole.UserRole + 1))
+        
+        font = index.data(Qt.ItemDataRole.FontRole)
+        if font is None or not font.isValid():
+            font = self.parent().font()
+        
+        name_color = self.beige_gold if is_playing else self.white
+        icon_color = self.saved_gold if saved else name_color
+        
+        rect = option.rect.adjusted(4, 0, -4, 0)
+        
+        icon_font = QFont(font)
+        icon_font.setBold(saved)
+        painter.setFont(icon_font)
+        icon_width = painter.fontMetrics().horizontalAdvance('♪') + 6
+        icon_rect = QRect(rect)
+        icon_rect.setWidth(icon_width)
+        painter.setPen(icon_color)
+        painter.drawText(icon_rect,
+                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                         '♪')
+        
+        name_rect = QRect(rect)
+        name_rect.setLeft(rect.left() + icon_width)
+        painter.setFont(font)
+        painter.setPen(name_color)
+        text = painter.fontMetrics().elidedText(
+            text, Qt.TextElideMode.ElideRight, max(0, name_rect.width()))
+        painter.drawText(name_rect,
+                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                         text)
 
 
 class SettingsDialog(QDialog):
@@ -1403,6 +1565,7 @@ class Musibisk(QMainWindow):
         # Start new watcher
         self.watcher_thread = FileWatcherThread(str(directory))
         self.watcher_thread.file_added.connect(self.add_file_to_playlist)
+        self.watcher_thread.file_deleted.connect(self.remove_file_from_playlist)
         self.watcher_thread.start()
         
         # Save config
@@ -1501,6 +1664,49 @@ class Musibisk(QMainWindow):
                 self.highlight_current_song()
                 self.player.play()
     
+    def remove_file_from_playlist(self, filepath: str):
+        """Remove a file from the playlist (it was deleted/moved out of the
+        watched directory outside of the app). No-op if already removed —
+        the in-app delete flow removes the entry before its event arrives."""
+        path = Path(filepath)
+        if path not in self.playlist:
+            return
+        
+        index = self.playlist.index(path)
+        was_current = (index == self.current_index)
+        
+        # Keep the remote consistent: if it was a saved song, remove it
+        # from the server (no-op there if it doesn't exist). The file is
+        # already gone, so the saved state comes from the row's cached
+        # flag (kept in sync by toggle_save_song), not the tag.
+        item = self.playlist_widget.item(index, 0)
+        was_saved = (bool(item.data(Qt.ItemDataRole.UserRole + 1))
+                     if item is not None else self.is_song_saved(path))
+        if was_saved:
+            self.sync_remove(self.get_remote_name(path))
+        
+        del self.playlist[index]
+        self.playlist_widget.removeRow(index)
+        
+        if was_current:
+            self.player.stop()
+            if self.playlist:
+                # The next song slid into this index
+                if self.current_index >= len(self.playlist):
+                    self.current_index = 0
+                self.load_current_song()
+                self.player.play()
+                self.play_pause_button.setText("⏸")
+            else:
+                self.current_index = -1
+                self.song_label.setText("No song loaded")
+                self.play_pause_button.setText("▶")
+                self._update_track_info()
+        else:
+            if index < self.current_index:
+                self.current_index -= 1
+            self.highlight_current_song()
+    
     def get_formatted_timestamp(self, filepath: Path) -> str:
         """Get formatted timestamp for file modification time"""
         try:
@@ -1529,9 +1735,12 @@ class Musibisk(QMainWindow):
         row = self.playlist_widget.rowCount()
         self.playlist_widget.insertRow(row)
         
-        # Song name column
-        song_item = QTableWidgetItem(f"♪ {song_name}")
+        # Song name column (the ♪ icon is drawn by the delegate; the saved
+        # flag in UserRole+1 makes it gold+bold)
+        song_item = QTableWidgetItem(song_name)
         song_item.setData(Qt.ItemDataRole.UserRole, filepath)
+        song_item.setData(Qt.ItemDataRole.UserRole + 1,
+                          1 if self.is_song_saved(filepath) else 0)
         song_item.setFlags(song_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.playlist_widget.setItem(row, 0, song_item)
         
@@ -1555,9 +1764,12 @@ class Musibisk(QMainWindow):
         
         self.playlist_widget.insertRow(0)
         
-        # Song name column
-        song_item = QTableWidgetItem(f"♪ {song_name}")
+        # Song name column (the ♪ icon is drawn by the delegate; the saved
+        # flag in UserRole+1 makes it gold+bold)
+        song_item = QTableWidgetItem(song_name)
         song_item.setData(Qt.ItemDataRole.UserRole, filepath)
+        song_item.setData(Qt.ItemDataRole.UserRole + 1,
+                          1 if self.is_song_saved(filepath) else 0)
         song_item.setFlags(song_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.playlist_widget.setItem(0, 0, song_item)
         
@@ -1647,8 +1859,8 @@ class Musibisk(QMainWindow):
         return filepath.stem
     
     def is_song_saved(self, filepath: Path) -> bool:
-        """Check if a song is marked as saved (has *_ prefix)"""
-        return filepath.name.startswith("*_")
+        """Check if a song is marked as saved (embedded metadata tag)"""
+        return read_saved_tag(filepath)
     
     def handle_volume_slider(self, value):
         """Handle volume slider value change"""
@@ -1698,14 +1910,12 @@ class Musibisk(QMainWindow):
         self._show_status(message, 5000)
     
     def get_remote_name(self, filepath: Path) -> str:
-        """Remote storage name for a song.
+        """Remote storage name for a song (its plain filename).
 
-        The local '*_' save marker is a UI detail, so on the remote server
-        the song is stored under its plain name. This keeps the remote name
-        stable across save/unsave/delete cycles.
+        The save marker is an embedded tag, so the name is stable across
+        save/unsave/delete cycles.
         """
-        name = filepath.name
-        return name[2:] if name.startswith('*_') else name
+        return filepath.name
     
     def sync_upload(self, filepath: Path, remote_name: str):
         """Queue an upload of the given file to the remote server"""
@@ -1718,7 +1928,8 @@ class Musibisk(QMainWindow):
             self.sync_worker.enqueue_remove(remote_name)
     
     def toggle_save_song(self):
-        """Toggle the save status of the current song"""
+        """Toggle the save status of the current song (embedded tag; the
+        filename never changes)"""
         if self.current_index < 0 or self.current_index >= len(self.playlist):
             return
         
@@ -1727,41 +1938,29 @@ class Musibisk(QMainWindow):
         if not current_file.exists():
             return
         
-        # Determine new filename
-        if self.is_song_saved(current_file):
-            # Remove *_ prefix
-            new_name = current_file.name[2:]  # Remove first 2 characters (*_)
+        now_saved = not self.is_song_saved(current_file)
+        if not set_saved_tag(current_file, now_saved):
+            self._show_status("Could not update saved status", 3000)
+            return
+        
+        self._show_status(
+            f"Song saved: {current_file.name}" if now_saved
+            else f"Song un-saved: {current_file.name}", 2000
+        )
+        
+        # Update the row's saved icon and the save button appearance
+        item = self.playlist_widget.item(self.current_index, 0)
+        if item:
+            item.setData(Qt.ItemDataRole.UserRole + 1,
+                         1 if now_saved else 0)
+        self.playlist_widget.viewport().update()
+        self.update_save_button()
+        
+        # Remote sync: upload when saving, remove when unsaving
+        if now_saved:
+            self.sync_upload(current_file, self.get_remote_name(current_file))
         else:
-            # Add *_ prefix
-            new_name = f"*_{current_file.name}"
-        
-        new_path = current_file.parent / new_name
-        
-        try:
-            # Rename the file
-            current_file.rename(new_path)
-            
-            # Update playlist
-            self.playlist[self.current_index] = new_path
-            
-            # Update playlist widget
-            self.refresh_playlist_widget()
-            
-            # Update current song display
-            song_name = self.get_song_name(new_path)
-            self.song_label.setText(song_name)
-            
-            # Update save button appearance
-            self.update_save_button()
-            
-            # Remote sync: upload when saving, remove when unsaving
-            if self.is_song_saved(new_path):
-                self.sync_upload(new_path, self.get_remote_name(new_path))
-            else:
-                self.sync_remove(self.get_remote_name(new_path))
-            
-        except Exception as e:
-            print(f"Error renaming file: {e}")
+            self.sync_remove(self.get_remote_name(current_file))
     
     def update_save_button(self):
         """Update save button appearance based on current song's save status"""
@@ -1788,13 +1987,6 @@ class Musibisk(QMainWindow):
             else:
                 # Reset to default style
                 self.save_button.setStyleSheet(BUTTON_FONT_SIZE)
-    
-    def refresh_playlist_widget(self):
-        """Refresh the playlist widget to reflect updated filenames"""
-        self.playlist_widget.setRowCount(0)
-        for file in self.playlist:
-            self.add_to_playlist_widget(file)
-        self.highlight_current_song()
     
     def reset_delete_state(self):
         """Reset delete button click state"""
