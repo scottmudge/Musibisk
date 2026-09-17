@@ -31,7 +31,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import (
     QAction, QKeySequence, QIcon, QPixmap, QMouseEvent, QFont, QFontDatabase,
-    QBrush, QColor, QPainter
+    QBrush, QColor, QPainter, QPainterPath
 )
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -73,111 +73,18 @@ def decrypt_secret(value: str) -> str:
     except Exception:
         return value
 
-def _rating_from_audio(audio) -> Optional[int]:
-    """Extract a 0-5 rating from parsed mutagen tags, or None if absent."""
-    if audio is None:
-        return None
-    tags = getattr(audio, 'tags', None)
-    if tags is None:
-        return None
-    try:
-        if isinstance(audio, mutagen.mp3.MP3):
-            from mutagen.id3 import TXXX
-            for frame in tags.values():
-                if isinstance(frame, TXXX) and str(frame.desc).upper() == 'RATING':
-                    try:
-                        return max(0, min(5, int(str(frame.text[0]))))
-                    except (ValueError, IndexError):
-                        return None
-            return None
-        if isinstance(audio, mutagen.mp4.MP4):
-            if '©rat' in tags and tags['©rat']:
-                # Written as 0, 60, 70, 80, 90, 100 for 0-5 stars
-                # (Apple's 60/80/100 scheme falls on the same points).
-                v = int(str(tags['©rat'][0]))
-                return 0 if v <= 20 else max(1, min(5, round((v - 50) / 10)))
-            return None
-        if 'RATING' in tags and tags['RATING']:
-            return max(0, min(5, int(str(tags['RATING'][0]))))
-    except Exception:
-        return None
-    return None
-
-
-def read_rating(filepath) -> Optional[int]:
-    """Read a 0-5 rating stored in the file's metadata, or None if absent."""
-    try:
-        audio = mutagen.File(filepath)
-    except Exception:
-        return None
-    return _rating_from_audio(audio)
-
-
-def write_rating(filepath, rating: int) -> bool:
-    """Write a 0-5 rating into the file's metadata. Returns True on success.
-
-    Storage per format: MP3 -> TXXX:RATING frame, MP4 -> ©rat atom,
-    FLAC/OGG/OPUS -> RATING metadata key.
-    """
-    try:
-        rating = max(0, min(5, int(rating)))
-        audio = mutagen.File(filepath)
-        if audio is None:
-            return False
-        if getattr(audio, 'tags', None) is None:
-            try:
-                audio.add_tags()
-            except Exception:
-                return False
-        tags = audio.tags
-        if tags is None:
-            return False
-        if isinstance(audio, mutagen.mp3.MP3):
-            from mutagen.id3 import TXXX
-            # ID3 keys are exact-match ('TXXX:RATING'), so locate the key by
-            # scanning; a frame instance alone cannot be deleted.
-            existing_key = None
-            for key in tags.keys():
-                if key.startswith('TXXX:') and key[5:].upper() == 'RATING':
-                    existing_key = key
-                    break
-            if rating == 0 and existing_key is not None:
-                del tags[existing_key]
-            elif existing_key is not None:
-                tags[existing_key].text = [str(rating)]
-            else:
-                tags.add(TXXX(encoding=3, desc='RATING', text=[str(rating)]))
-        elif isinstance(audio, mutagen.mp4.MP4):
-            # ©rat is a freeform (string) atom in mutagen
-            tags['©rat'] = [str([0, 60, 70, 80, 90, 100][rating])]
-        else:
-            if rating == 0:
-                try:
-                    del tags['RATING']
-                except KeyError:
-                    pass
-            else:
-                tags['RATING'] = [str(rating)]
-        audio.save()
-        return True
-    except Exception as e:
-        print(f"Error writing rating: {e}")
-        return False
-
-
 def read_track_info(filepath) -> dict:
     """Read display metadata for a track. Missing fields are None.
 
-    Returns a dict with keys: title, artist, album, year, genre, track,
-    rating (int or None) and cover ((bytes, mime) or None).
+    Returns a dict with keys: title, artist, album, year, genre, track
+    and cover ((bytes, mime) or None).
     """
     info = {'title': None, 'artist': None, 'album': None, 'year': None,
-            'genre': None, 'track': None, 'rating': None, 'cover': None}
+            'genre': None, 'track': None, 'cover': None}
     try:
         audio = mutagen.File(filepath)
         if audio is None:
             return info
-        info['rating'] = _rating_from_audio(audio)
         tags = getattr(audio, 'tags', None)
         if tags is None:
             return info
@@ -833,19 +740,16 @@ class TrackInfoPanel(QWidget):
     Part of the main window, docked to the right of the main content behind
     a thin vertical separator (the menu bar row only covers the left column,
     so it stops at that separator). Shows cover art, title, artist, album,
-    year and genre when present in the file metadata, plus an interactive
-    0-5 star rating. Rating changes are reported to the main window via the
-    rating_changed signal, which persists them.
+    year and genre when present in the file metadata. The content is
+    vertically centered in the panel.
     """
-    rating_changed = pyqtSignal(object, int)  # (path, new_rating)
-
     WIDTH = 260
-    ART_SIZE = 200
+    ART_SIZE = 220
+    ART_RADIUS = 10
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_path: Optional[Path] = None
-        self.rating: int = 0
 
         self.setFixedWidth(self.WIDTH)
 
@@ -853,12 +757,15 @@ class TrackInfoPanel(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(6)
 
+        layout.addStretch(1)
+
         # Cover art (or a placeholder glyph when the track has none)
         self.cover_label = QLabel(self)
         self.cover_label.setFixedSize(self.ART_SIZE, self.ART_SIZE)
         self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover_label.setStyleSheet(
-            "background-color: #2d2d2d; border-radius: 10px;")
+            "background-color: #2d2d2d; border-radius: "
+            f"{self.ART_RADIUS}px;")
         self.cover_glyph = QLabel("♫", self.cover_label)
         self.cover_glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover_glyph.setStyleSheet("font-size: 72px; color: #444444;")
@@ -876,28 +783,6 @@ class TrackInfoPanel(QWidget):
 
         layout.addStretch(1)
 
-        # Clickable star rating (click a star to set it; click the current
-        # rating again to clear it)
-        self.star_row = QHBoxLayout()
-        self.star_row.setSpacing(2)
-        self.stars = []
-        for i in range(1, 6):
-            star = QLabel('★', self)
-            star.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            star.setFixedSize(34, 30)
-            star.setCursor(Qt.CursorShape.PointingHandCursor)
-            star._star_number = i
-            star.mousePressEvent = lambda event, n=i: self._star_clicked(n)
-            self.stars.append(star)
-            self.star_row.addWidget(star)
-        layout.addLayout(self.star_row)
-
-        self.hint_label = self._make_label(9, color="#666666")
-        self.hint_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        self.hint_label.setWordWrap(True)
-        layout.addWidget(self.hint_label)
-
-        self._render_stars()
         self.clear()
 
     def _make_label(self, size: int, bold: bool = False,
@@ -926,8 +811,6 @@ class TrackInfoPanel(QWidget):
         """Populate the panel from the file's metadata."""
         self.current_path = filepath
         info = read_track_info(filepath)
-        self.rating = info['rating'] if info['rating'] is not None else 0
-        self._render_stars()
 
         self.title_label.setText(info['title'] or filepath.stem)
         self.title_label.setVisible(True)
@@ -942,10 +825,11 @@ class TrackInfoPanel(QWidget):
             fmt = cover[1].split('/')[-1].upper()
             pixmap.loadFromData(QByteArray(cover[0]), fmt)
             if not pixmap.isNull():
-                self.cover_label.setPixmap(pixmap.scaled(
+                scaled = pixmap.scaled(
                     self.ART_SIZE, self.ART_SIZE,
                     Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation))
+                    Qt.TransformationMode.SmoothTransformation)
+                self.cover_label.setPixmap(self._round_pixmap(scaled))
                 self.cover_glyph.setVisible(False)
                 return
         self.cover_label.setPixmap(QPixmap())
@@ -954,36 +838,28 @@ class TrackInfoPanel(QWidget):
     def clear(self):
         """Reset the panel to the 'no track' state."""
         self.current_path = None
-        self.rating = 0
-        self._render_stars()
         self.title_label.setText('No track loaded')
         self.title_label.setVisible(True)
         for lbl in (self.artist_label, self.album_label, self.extra_label):
             self._set_field(lbl, None)
         self.cover_label.setPixmap(QPixmap())
         self.cover_glyph.setVisible(True)
-        self.hint_label.setText('Click a star to rate ·\nclick it again to clear')
 
-    def set_rating(self, rating: int):
-        """Update the displayed rating (after a successful metadata write)."""
-        self.rating = max(0, min(5, rating))
-        self._render_stars()
-
-    def _render_stars(self):
-        for star in self.stars:
-            if star._star_number <= self.rating:
-                color, hover = '#ffd700', '#ffe27a'
-            else:
-                color, hover = '#4a4a4a', '#777777'
-            star.setStyleSheet(
-                f"QLabel {{ color: {color}; }}"
-                f"QLabel:hover {{ color: {hover}; }}")
-
-    def _star_clicked(self, number: int):
-        if self.current_path is None:
-            return
-        new_rating = 0 if number == self.rating else number
-        self.rating_changed.emit(self.current_path, new_rating)
+    def _round_pixmap(self, pixmap: QPixmap) -> QPixmap:
+        """Return a copy of the pixmap with anti-aliased rounded corners,
+        matching the placeholder box's radius."""
+        mask = QPixmap(pixmap.size())
+        mask.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(mask)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(
+            0, 0, pixmap.width(), pixmap.height(),
+            self.ART_RADIUS, self.ART_RADIUS)
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, pixmap)
+        painter.end()
+        return mask
 
 
 class Musibisk(QMainWindow):
@@ -1272,7 +1148,6 @@ class Musibisk(QMainWindow):
         
         # Track info panel (right side)
         self.info_panel = TrackInfoPanel(left_widget)
-        self.info_panel.rating_changed.connect(self.on_rating_changed)
         
         root_layout.addWidget(left_widget, 1)
         root_layout.addWidget(panel_separator)
@@ -1436,29 +1311,6 @@ class Musibisk(QMainWindow):
             self.info_panel.set_track(self.playlist[self.current_index])
         else:
             self.info_panel.clear()
-
-    def on_rating_changed(self, filepath: Path, rating: int):
-        """Persist a star rating into the track's metadata."""
-        if write_rating(filepath, rating):
-            self.info_panel.set_rating(rating)
-            self._update_playlist_timestamp(filepath)
-            self._show_status(
-                f"Rating set to {rating}/5" if rating else "Rating cleared",
-                2000
-            )
-        else:
-            self.info_panel.set_rating(read_rating(filepath) or 0)
-            self._show_status("Could not update rating", 3000)
-
-    def _update_playlist_timestamp(self, filepath: Path):
-        """Refresh the modified-time cell for a row after a metadata edit."""
-        for row in range(self.playlist_widget.rowCount()):
-            item = self.playlist_widget.item(row, 0)
-            if item and item.data(Qt.ItemDataRole.UserRole) == filepath:
-                time_item = self.playlist_widget.item(row, 2)
-                if time_item:
-                    time_item.setText(self.get_formatted_timestamp(filepath))
-                break
 
     def setup_global_hotkeys(self):
         """Setup global hotkeys for media control"""
