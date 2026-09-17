@@ -6,6 +6,7 @@ Musibisk - A sleek, minimal music player with directory monitoring
 import sys
 import json
 import os
+import re
 import queue
 from pathlib import Path
 from typing import List, Optional
@@ -558,6 +559,102 @@ class SettingsDialog(QDialog):
         return self.sync_password_edit.text()
 
 
+class GlyphCenteredButton(QPushButton):
+    """QPushButton that keeps its text glyph vertically centered.
+
+    Emoji glyphs (e.g. from Noto Color Emoji) and text glyphs (e.g. from
+    DejaVu Sans) are placed at different heights within the font's em box, so
+    the same button can look slightly high or low depending on which glyph is
+    shown and which fonts are installed. The button renders its current text,
+    measures the glyph's bounding box, and compensates with padding-top (glyph
+    too high) or padding-bottom (glyph too low). The compensation is
+    re-applied whenever the text or the stylesheet changes, so buttons whose
+    glyph changes (play/pause, loop mode) stay centered after the swap.
+    """
+
+    def __init__(self, text="", parent=None):
+        self._glyph_padding = (0, 0)
+        self._base_sheet = ""
+        super().__init__(text, parent)
+
+    def setStyleSheet(self, sheet):
+        self._base_sheet = sheet
+        super().setStyleSheet(self._sheet_with_padding())
+        self._recenter_glyph()
+
+    def setText(self, text):
+        super().setText(text)
+        self._recenter_glyph()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # The effective font (QSS font-size, inherited weight, DPI) is only
+        # final once the widget is shown; re-measure so the compensation is
+        # computed in the same context the button renders in.
+        self._recenter_glyph()
+
+    def _sheet_with_padding(self):
+        """Base stylesheet plus the managed padding rules."""
+        top, bottom = self._glyph_padding
+        if not top and not bottom:
+            return self._base_sheet
+        rules = []
+        if top:
+            rules.append(f"padding-top: {top}px;")
+        if bottom:
+            rules.append(f"padding-bottom: {bottom}px;")
+        extra = " ".join(rules)
+        base = self._base_sheet
+        if not base:
+            return extra
+        if "{" in base:
+            # Insert the managed rules inside the first rule block.
+            return re.sub(r"\{", "{ " + extra + " ", base, count=1)
+        return f"{base} {extra}"
+
+    def _recenter_glyph(self):
+        """Measure the current glyph's offset from center and re-apply padding."""
+        text = self.text()
+        if not text:
+            return
+
+        rect = self.contentsRect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        pixmap = QPixmap(rect.size())
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setFont(self.font())
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+        painter.end()
+
+        image = pixmap.toImage()
+        dpr = pixmap.devicePixelRatio()
+        min_row = max_row = None
+        for row in range(image.height()):
+            for col in range(image.width()):
+                if image.pixelColor(col, row).alpha() > 20:
+                    if min_row is None:
+                        min_row = row
+                    max_row = row
+                    break
+        if min_row is None:
+            return
+
+        offset = ((min_row + max_row) / 2) / dpr - rect.height() / 2
+        if offset < -0.75:
+            padding = (int(round(-2 * offset)), 0)   # too high -> push down
+        elif offset > 0.75:
+            padding = (0, int(round(2 * offset)))    # too low -> push up
+        else:
+            padding = (0, 0)
+        if padding == self._glyph_padding:
+            return
+        self._glyph_padding = padding
+        super().setStyleSheet(self._sheet_with_padding())
+
+
 class Musibisk(QMainWindow):
     """Main application window"""
     
@@ -587,6 +684,7 @@ class Musibisk(QMainWindow):
         self.sync_key_file: str = ''
         self.sync_password: str = ''
         self.sync_worker: Optional[SyncWorker] = None
+        self._status_hide_timer: Optional[QTimer] = None
         
         # Delete button state
         self.delete_click_count = 0
@@ -619,13 +717,6 @@ class Musibisk(QMainWindow):
         self.sync_worker.log_message.connect(self.on_sync_log)
         self.sync_worker.start()
         self.apply_sync_config()
-        
-        # Compensate for font-dependent glyph vertical offsets
-        self.center_button_glyph(self.prev_button)
-        self.center_button_glyph(self.play_pause_button)
-        self.center_button_glyph(self.next_button)
-        self.center_button_glyph(self.loop_button)
-        self.center_button_glyph(self.delete_button)
     
     def init_ui(self):
         """Initialize the user interface"""
@@ -675,7 +766,6 @@ class Musibisk(QMainWindow):
         self.playlist_widget = QTableWidget()
         self.playlist_widget.setColumnCount(3)
         self.playlist_widget.setHorizontalHeaderLabels(["Song", "Length", "Modified"])
-        self.playlist_widget.setMaximumHeight(180)
         self.playlist_widget.setStyleSheet(f"font-family: {BitmapFontFamily};")
         self.playlist_widget.cellDoubleClicked.connect(self.on_playlist_item_clicked)
         self.playlist_widget.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -732,22 +822,22 @@ class Musibisk(QMainWindow):
         
         button_size = 45  # All buttons same size
         
-        self.prev_button = QPushButton("⏮")
+        self.prev_button = GlyphCenteredButton("⏮")
         self.prev_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.prev_button.setFixedSize(button_size, button_size)
         self.prev_button.clicked.connect(self.previous_song)
         
-        self.play_pause_button = QPushButton("▶")
+        self.play_pause_button = GlyphCenteredButton("▶")
         self.play_pause_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.play_pause_button.setFixedSize(button_size, button_size)
         self.play_pause_button.clicked.connect(self.toggle_play_pause)
         
-        self.next_button = QPushButton("⏭")
+        self.next_button = GlyphCenteredButton("⏭")
         self.next_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.next_button.setFixedSize(button_size, button_size)
         self.next_button.clicked.connect(self.next_song)
         
-        self.loop_button = QPushButton("🔁")
+        self.loop_button = GlyphCenteredButton("🔁")
         self.loop_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.loop_button.setFixedSize(button_size, button_size)
         self.loop_button.clicked.connect(self.toggle_loop_mode)
@@ -761,14 +851,14 @@ class Musibisk(QMainWindow):
         separator.setFixedHeight(button_size)
         
         # Save button (floppy disk icon)
-        self.save_button = QPushButton("💾")
+        self.save_button = GlyphCenteredButton("💾")
         self.save_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.save_button.setFixedSize(button_size, button_size)
         self.save_button.clicked.connect(self.toggle_save_song)
         self.save_button.setToolTip("Save/unsave current song")
         
         # Delete button
-        self.delete_button = QPushButton("🗑")
+        self.delete_button = GlyphCenteredButton("🗑")
         self.delete_button.setStyleSheet(BUTTON_FONT_SIZE)
         self.delete_button.setFixedSize(button_size, button_size)
         self.delete_button.clicked.connect(self.handle_delete_click)
@@ -808,9 +898,6 @@ class Musibisk(QMainWindow):
         controls_layout.addStretch()
         
         layout.addLayout(controls_layout)
-        
-        # Status bar (shows sync progress and other transient messages)
-        self.statusBar().setStyleSheet("background-color: #1e1e1e; color: #888; font-size: 10px;")
     
     def apply_style(self):
         """Apply dark theme styling"""
@@ -961,50 +1048,6 @@ class Musibisk(QMainWindow):
                 background: none;
             }
         """)
-    
-    def center_button_glyph(self, button: QPushButton):
-        """Nudge a button's text so the rendered glyph is vertically centered.
-
-        Emoji glyphs (e.g. from Noto Color Emoji) and text glyphs (e.g. from
-        DejaVu Sans) are placed at different heights within the font's em box,
-        so the same button text can appear slightly high or low depending on
-        which font provides the glyph. Measure the rendered glyph's bounding
-        box and add padding-top to compensate for any upward misalignment.
-        """
-        text = button.text()
-        if not text:
-            return
-        
-        rect = button.contentsRect()
-        if rect.width() <= 0 or rect.height() <= 0:
-            return
-        
-        pixmap = QPixmap(rect.size())
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        painter.setFont(button.font())
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
-        painter.end()
-        
-        image = pixmap.toImage()
-        dpr = pixmap.devicePixelRatio()
-        min_row = max_row = None
-        for row in range(image.height()):
-            for col in range(image.width()):
-                if image.pixelColor(col, row).alpha() > 20:
-                    if min_row is None:
-                        min_row = row
-                    max_row = row
-                    break
-        if min_row is None:
-            return
-        
-        offset = ((min_row + max_row) / 2) / dpr - rect.height() / 2
-        if offset >= -0.75:
-            return  # glyph is not meaningfully above center
-        
-        padding = int(round(-2 * offset))
-        button.setStyleSheet(f"{button.styleSheet()} padding-top: {padding}px;")
     
     def setup_global_hotkeys(self):
         """Setup global hotkeys for media control"""
@@ -1361,13 +1404,32 @@ class Musibisk(QMainWindow):
         self.sync_enabled = checked
         self.apply_sync_config()
         self.save_config()
-        self.statusBar().showMessage(
+        self._show_status(
             "Remote sync enabled" if checked else "Remote sync disabled", 3000
         )
     
+    def _show_status(self, message: str, timeout: int):
+        """Show a transient message in a lazily-created status bar.
+
+        The status bar is only created (and thus only reserves window space)
+        while a message is showing, so the control buttons sit close to the
+        bottom edge of the window the rest of the time. The hide timer is
+        restarted on each message so rapid consecutive messages don't cut
+        each other off.
+        """
+        bar = self.statusBar()
+        bar.setStyleSheet("background-color: #1e1e1e; color: #888; font-size: 10px;")
+        bar.setVisible(True)
+        bar.showMessage(message, timeout)
+        if self._status_hide_timer is None:
+            self._status_hide_timer = QTimer(self)
+            self._status_hide_timer.setSingleShot(True)
+            self._status_hide_timer.timeout.connect(bar.hide)
+        self._status_hide_timer.start(timeout)
+    
     def on_sync_log(self, message: str):
         """Show sync progress/errors in the status bar"""
-        self.statusBar().showMessage(message, 5000)
+        self._show_status(message, 5000)
     
     def get_remote_name(self, filepath: Path) -> str:
         """Remote storage name for a song.
