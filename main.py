@@ -712,7 +712,7 @@ class Musibisk(QMainWindow):
         if not self.playlist:
             return -1
         
-        if self.play_order == PlayOrder.NEWEST_TO_OLDEST:
+        if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
             # Moving forward through the list (bottom to top in display)
             return (self.current_index + 1) % len(self.playlist)
         else:  # NEWEST_TO_OLDEST
@@ -727,7 +727,7 @@ class Musibisk(QMainWindow):
         if not self.playlist:
             return -1
         
-        if self.play_order == PlayOrder.NEWEST_TO_OLDEST:
+        if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
             # Moving backward through the list (top to bottom in display)
             prev_idx = self.current_index - 1
             if prev_idx < 0:
@@ -742,7 +742,7 @@ class Musibisk(QMainWindow):
         if not self.playlist:
             return -1
         
-        if self.play_order == PlayOrder.NEWEST_TO_OLDEST:
+        if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
             # Start at the end (oldest song, which is at bottom)
             return len(self.playlist) - 1
         else:  # NEWEST_TO_OLDEST
@@ -790,6 +790,8 @@ class Musibisk(QMainWindow):
             # Adjust current index if necessary
             if self.current_index >= 0:
                 self.current_index += 1
+                # Update the highlighted row to match the new index
+                self.highlight_current_song()
             
             # If nothing is playing, start playing from the appropriate position
             if self.current_index == -1:
@@ -853,11 +855,19 @@ class Musibisk(QMainWindow):
             filepath = item.data(Qt.ItemDataRole.UserRole)
             try:
                 index = self.playlist.index(filepath)
+                
+                # Store current scroll position
+                scrollbar = self.playlist_widget.verticalScrollBar()
+                scroll_pos = scrollbar.value()
+                
                 self.current_index = index
                 self.load_current_song()
                 self.highlight_current_song()
                 self.player.play()
                 self.play_pause_button.setText("⏸")
+                
+                # Restore scroll position to prevent auto-scroll
+                scrollbar.setValue(scroll_pos)
                 
                 # Reset delete click counter when changing songs
                 self.reset_delete_state()
@@ -1026,6 +1036,11 @@ class Musibisk(QMainWindow):
         if not current_file.exists():
             return
         
+        # Prevent deletion of saved songs
+        if self.is_song_saved(current_file):
+            print(f"Cannot delete saved song: {current_file.name}")
+            return
+        
         try:
             # Stop playback
             self.player.stop()
@@ -1039,9 +1054,21 @@ class Musibisk(QMainWindow):
             
             # Move to next song or stop if no more songs
             if self.playlist:
-                # Adjust index if at end
-                if self.current_index >= len(self.playlist):
-                    self.current_index = len(self.playlist) - 1
+                # Determine next index based on play order
+                if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
+                    # Playing bottom-to-top (increasing indices)
+                    # After deletion, current_index now points to what was the next song
+                    # If we deleted the last song, wrap to beginning
+                    if self.current_index >= len(self.playlist):
+                        self.current_index = 0
+                    # Otherwise current_index is already pointing at the next song
+                else:  # NEWEST_TO_OLDEST
+                    # Playing top-to-bottom (decreasing indices)
+                    # After deletion at position N, the song that was at N+1 is now at N
+                    # We want to continue downward, so stay at current_index
+                    # But if we deleted at the bottom, go to top
+                    if self.current_index >= len(self.playlist):
+                        self.current_index = 0
                 
                 # Load and play next song
                 self.load_current_song()
@@ -1153,7 +1180,7 @@ class Musibisk(QMainWindow):
                 self.next_song()
             else:
                 # No loop - check if we should continue based on play order
-                if self.play_order == PlayOrder.NEWEST_TO_OLDEST:
+                if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
                     # Playing oldest to newest (bottom to top)
                     # Continue if not at top (index 0)
                     if self.current_index > 0:
