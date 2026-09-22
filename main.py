@@ -8,8 +8,8 @@ import json
 import os
 import re
 import struct
-import subprocess
 import queue
+import threading
 from pathlib import Path
 from typing import List, Optional
 from enum import Enum
@@ -17,6 +17,16 @@ import base64
 import time
 from datetime import datetime
 from urllib.parse import urlsplit
+
+try:
+    import numpy as np  # FFT for the spectrum visualizer (pip install numpy)
+except ImportError:
+    np = None
+
+try:
+    import av  # PyAV: in-process FFmpeg decode, no subprocess (pip install av)
+except ImportError:
+    av = None
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -28,12 +38,12 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QUrl, QThread, pyqtSignal, QObject, QByteArray,
-    QModelIndex, QRect, QElapsedTimer, QPointF
+    QModelIndex, QRect, QElapsedTimer, QPointF, QRectF
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import (
     QAction, QKeySequence, QIcon, QPixmap, QMouseEvent, QFont, QFontDatabase,
-    QBrush, QColor, QPainter, QPainterPath, QPolygonF
+    QBrush, QColor, QPainter, QPainterPath, QPolygonF, QPen, QLinearGradient
 )
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -902,34 +912,51 @@ def compute_waveform_peaks(filepath, cols_per_second=120):
     """Compute a normalized amplitude profile (values in (0, 1]) for a file,
     one value per column of a WaveformVisualizer.
 
-    Decodes the track once with ffmpeg (mono float32, 10 samples per
-    column) when available; falls back to a content-energy heuristic on the
-    raw bytes so the visualizer still works without ffmpeg. Returns [] on
+    Decodes the track once, in-process, with PyAV (mono float32, 10 samples
+    per column) when available; falls back to a content-energy heuristic on
+    the raw bytes so the visualizer still works without PyAV. Returns [] on
     failure.
     """
     decode_rate = cols_per_second * 10
     data = None
-    try:
-        proc = subprocess.run(
-            ['ffmpeg', '-v', 'error', '-i', str(filepath),
-             '-f', 'f32le', '-acodec', 'pcm_f32le', '-ac', '1',
-             '-ar', str(decode_rate), '-'],
-            capture_output=True, timeout=60)
-        data = proc.stdout
-    except Exception:
-        data = None
+    if av is not None:
+        container = None
+        try:
+            container = av.open(str(filepath))
+            stream = container.streams.audio[0]
+            resampler = av.AudioResampler(
+                format='flt', layout='mono', rate=decode_rate)
+            chunks = []
+            for frame in container.decode(stream):
+                for out in resampler.resample(frame):
+                    chunks.append(out.to_ndarray().ravel().tobytes())
+            data = b''.join(chunks)
+        except Exception:
+            data = None
+        finally:
+            if container is not None:
+                try:
+                    container.close()
+                except Exception:
+                    pass
 
     if data and len(data) >= 4:
-        samples = struct.unpack(f'<{len(data) // 4}f', data)
         per = max(1, decode_rate // cols_per_second)
-        peaks = []
-        for i in range(0, len(samples) - (len(samples) % per), per):
-            top = 0.0
-            for v in samples[i:i + per]:
-                av = -v if v < 0 else v
-                if av > top:
-                    top = av
-            peaks.append(top)
+        if np is not None:
+            samples = np.frombuffer(data, dtype='<f4')
+            n_full = len(samples) - (len(samples) % per)
+            peaks = [float(t) for t in
+                     np.abs(samples[:n_full].reshape(-1, per)).max(axis=1)]
+        else:
+            samples = struct.unpack(f'<{len(data) // 4}f', data)
+            peaks = []
+            for i in range(0, len(samples) - (len(samples) % per), per):
+                top = 0.0
+                for v in samples[i:i + per]:
+                    magn = -v if v < 0 else v
+                    if magn > top:
+                        top = magn
+                peaks.append(top)
         if peaks:
             scale = max(peaks)
             if scale > 0:
@@ -962,6 +989,159 @@ def compute_waveform_peaks(filepath, cols_per_second=120):
         return []
 
 
+class _AudioTapReader:
+    """In-process audio tap: decode the track with PyAV (FFmpeg compiled
+    into a shared library — no subprocess) in a worker thread and pump raw
+    PCM (44.1 kHz stereo float32) into a bounded in-memory buffer.
+
+    The visualizer pulls (drains) bytes off the front in realtime-paced
+    amounts, so the displayed audio matches the player's clock. Decoding
+    runs ~1000x faster than realtime, so the buffer (a few seconds of
+    head-room) fills instantly and the thread then blocks until the
+    consumer drains it — decode CPU is a one-shot burst per
+    play/seek and zero otherwise. The decoder only exists while audio is
+    playing: pausing stops it (zero decode CPU while paused) and
+    resume/seek restarts it at the right offset.
+    """
+    _CAP_BYTES = 4 * 1024 * 1024  # ~45 s of f32le stereo (headroom, not latency)
+    _SR = 44100
+
+    def __init__(self, parent=None):
+        self._buf = bytearray()
+        self._cond = threading.Condition()
+        self._thread = None
+        self._running = False
+        self._gen = 0
+
+    # ------------------------------------------------------------ lifecycle
+    def open_track(self, path, offset_ms):
+        """(Re)start decoding `path` from `offset_ms` (main thread)."""
+        with self._cond:
+            # retire any previous decode generation first
+            self._running = False
+            self._cond.notify_all()
+            del self._buf[:]
+            self._gen += 1
+            self._running = True
+        thread = threading.Thread(
+            target=self._run, args=(self._gen, str(path),
+                                    float(max(0.0, offset_ms))),
+            daemon=True)
+        prev = self._thread
+        self._thread = thread
+        thread.start()
+        if prev is not None and prev is not threading.current_thread():
+            prev.join(1.5)  # keeps the shared buffer single-writer
+
+    def close_track(self):
+        """Stop the decoder (if any) and clear the buffer (main thread)."""
+        with self._cond:
+            self._running = False
+            self._cond.notify_all()
+            del self._buf[:]
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(1.5)
+
+    def alive(self):
+        """True while a decode generation is still running.
+
+        False means either "never opened / closed" or "open failed"
+        (unsupported file, missing av) — the visualizer treats a dead tap
+        as disabled.
+        """
+        return (self._running and self._thread is not None
+                and self._thread.is_alive())
+
+    # -------------------------------------------------------------- decode
+    def _run(self, gen, path, offset_ms):
+        """Decode loop (worker thread). Writes only while `gen` is current,
+        so a superseded generation can never corrupt a new tap."""
+        container = None
+        ok = False
+        if av is not None:
+            try:
+                container = av.open(path)
+                stream = container.streams.audio[0]
+                resampler = av.AudioResampler(
+                    format='flt', layout='stereo', rate=self._SR)
+                offset_us = int(offset_ms * 1000)
+                if offset_us > 0:
+                    # backward=True: land on the last keyframe AT/BEFORE the
+                    # target; pre-target frames are skipped below
+                    container.seek(offset_us, any_frame=False,
+                                   backward=True, stream=stream)
+                skip = offset_us > 0
+                for frame in container.decode(stream):
+                    if gen != self._gen:
+                        break
+                    if skip:
+                        if frame.pts is None:
+                            skip = False  # untimestamped: assume in place
+                        else:
+                            pts_us = int(round(
+                                float(frame.pts * stream.time_base) * 1e6))
+                            if pts_us < offset_us:
+                                continue
+                            skip = False
+                    for out in resampler.resample(frame):
+                        data = out.to_ndarray().ravel().tobytes()
+                        with self._cond:
+                            if gen != self._gen:
+                                break
+                            # bounded queue: if the cap is hit, block until
+                            # the consumer drains some (decoding is ~1000x
+                            # realtime, so this is the normal state)
+                            while (len(self._buf) + len(data)
+                                   > self._CAP_BYTES
+                                   and self._running
+                                   and gen == self._gen):
+                                self._cond.wait(0.25)
+                            if gen != self._gen:
+                                break
+                            self._buf.extend(data)
+                            self._cond.notify()
+                ok = True
+            except Exception:
+                ok = False
+            finally:
+                if container is not None:
+                    try:
+                        container.close()
+                    except Exception:
+                        pass
+        if not ok:
+            # open/decode failed: report death so the tap is disabled
+            with self._cond:
+                if gen == self._gen:
+                    self._running = False
+                    self._cond.notify_all()
+        else:
+            # decode finished (EOF or stop): keep the thread alive until
+            # closed so a fully-prefilled buffer can still be drained
+            # (short tracks fit entirely inside the cap)
+            with self._cond:
+                while self._running and gen == self._gen:
+                    self._cond.wait(0.25)
+
+    # --------------------------------------------------------------- buffer
+    def pending(self) -> int:
+        with self._cond:
+            return len(self._buf)
+
+    def drain(self, n: int) -> bytes:
+        """Pull up to n bytes off the front (main thread)."""
+        with self._cond:
+            n = min(n, len(self._buf))
+            if n <= 0:
+                return b''
+            out = bytes(self._buf[:n])
+            del self._buf[:n]
+            self._cond.notify()
+        return out
+
+
 class _WaveformWorker(QThread):
     """Decode one track's amplitude profile in the background."""
     done = pyqtSignal(int, list)  # (generation, peaks)
@@ -977,22 +1157,34 @@ class _WaveformWorker(QThread):
 
 
 class WaveformVisualizer(QWidget):
-    """Realtime waveform display for the playing track.
+    """Realtime visualizer box for the playing track.
 
-    Low-resource design: the track's amplitude profile is decoded ONCE in a
-    background thread and cached as a plain list of floats. Each frame draws
-    only the ~260 visible columns as two antialiased polygons (played/accent,
-    upcoming/dim) — no per-frame decoding and no per-frame bitmap
-    generation. Vertex positions are sub-pixel floats, so the scroll is
-    perfectly smooth (QPainter rounds fractional *image* blits, but
-    antialiased vector geometry honors the fraction).
+    Four visualizers share the same 260x44 box; click the box to cycle:
+      waveform      - the track's full amplitude profile, scrolling
+      vu            - two VU bars (left/right; identical for mono)
+      spectrum      - frequency-bin intensity bars (gray -> gold gradient)
+      oscilloscope  - the current audio waveform, like a real scope
 
-    The playhead sits at the horizontal middle; the position is a local
-    time line (anchored to the first player report, advanced by the real
-    clock) plus a persistent low-passed correction for the player's coarse,
-    slightly late reports — constant between reports, so the scroll speed
-    never pulses. Frames are drawn on a drift-corrected 60 FPS grid via a
-    4 ms timer, which itself runs only while audio is actually playing.
+    Low-resource design:
+      * waveform: the amplitude profile is decoded ONCE in a background
+        thread and cached; each frame draws only the ~260 visible columns
+        as antialiased polygons with sub-pixel vertices (smooth scroll).
+      * vu/spectrum/scope: the track is decoded IN-PROCESS with PyAV
+        (FFmpeg as a shared library — no subprocess) in a worker thread
+        that pumps raw PCM into a bounded buffer; the main thread consumes
+        it in realtime paced amounts (a few KB per frame). The spectrum is
+        a 4096-point numpy FFT per frame (~tens of microseconds);
+        everything else is small vector ops. The decoder is STOPPED while
+        paused (zero decode CPU) and restarted on resume/seek at the right
+        offset.
+    All drawing runs on a drift-corrected 60 FPS grid via a 2 ms timer
+    that idles when nothing is animating.
+
+    The waveform playhead sits at the horizontal middle; the position is a
+    local time line (anchored to the first player report, advanced by the
+    real clock) plus a persistent low-passed correction for the player's
+    coarse, slightly late reports — constant between reports, so the
+    scroll speed never pulses.
     """
     HEIGHT = 44
     #     Tunable knob — sets BOTH the horizontal resolution and the scroll
@@ -1003,21 +1195,50 @@ class WaveformVisualizer(QWidget):
     COLS_PER_SECOND = 120
     PLAYHEAD_RATIO = 0.5  # playhead ("now" line) at the horizontal middle
 
+    MODES = ('waveform', 'vu', 'spectrum', 'oscilloscope')
+    MODE_LABELS = {'waveform': 'WAVE', 'vu': 'VU',
+                   'spectrum': 'SPEC', 'oscilloscope': 'SCOPE'}
+
     BG_COLOR = QColor('#1b1b1b')
     BORDER_COLOR = QColor('#3d3d3d')
     ACCENT_COLOR = QColor('#ffd700')
     DIM_COLOR = QColor('#555555')
     PLACEHOLDER_COLOR = QColor('#333333')
     PLAYHEAD_COLOR = QColor('#ffffff')
+    LABEL_COLOR = QColor('#666666')
+    SPECTRUM_BASE_COLOR = QColor('#5a5a5a')  # gradient bottom (gray)
 
     _ALPHA = 0.25            # per-report low-pass factor on the clock offset
     _SNAP_THRESHOLD_MS = 1500.0  # larger discontinuities (seeks) snap
+    _PAUSED_STALE_MS = 1000.0    # backward reports this close while paused
+    # are stale samples from the just-paused buffer and are ignored
     _FRAME_PERIOD = 1000.0 / 60.0  # 60 FPS drawing grid
     _TIMER_MS = 2            # wake frequently enough to hit the grid on time
+
+    # Audio tap / derived-data parameters (44.1 kHz f32le stereo = 352 800
+    # bytes/s; one frame is 8 bytes)
+    _SR = 44100
+    _RATE_BPS = 44100 * 2 * 4
+    _RING_FRAMES = 8192      # ring buffer of decoded frames (4096/side)
+    _SPEC_BINS = 48          # spectrum bar count
+    _SPEC_FRAME = 4096       # FFT size
+    _SPEC_F0 = 40.0          # lowest bar frequency (Hz)
+    _SPEC_F1 = 16000.0       # highest bar frequency (Hz)
+    _SCOPE_N = 220           # oscilloscope samples shown
+    _VU_DECAY = 0.88         # per-frame VU release (60 fps)
+    _SPEC_DECAY = 0.90       # per-frame spectrum release while paused
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(self.HEIGHT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        if av is None:
+            self.setToolTip("Live VU / spectrum / oscilloscope need the\n"
+                            "'av' package (pip install av).\n"
+                            "Click to switch visualizer")
+        else:
+            self.setToolTip("Click to switch visualizer "
+                            "(waveform / VU / spectrum / oscilloscope)")
         self._generation = 0
         self._track_path = None
         self._peaks: List[float] = []
@@ -1034,9 +1255,45 @@ class WaveformVisualizer(QWidget):
         self._timer.timeout.connect(self._tick)
         self._clock.start()
 
+        # -- visualizer mode --
+        self._mode = 'waveform'
+        self._label_font = QFont()
+        self._label_font.setPixelSize(8)
+
+        # -- audio tap (live PCM) and derived data --
+        self._tap = _AudioTapReader(self)
+        self._tap_path: Optional[Path] = None
+        self._tap_active = False          # in-process decoder running
+        self._tap_offset_ms = 0.0         # file offset (ms) of the anchor
+        self._tap_anchor_time = 0.0       # clock ms of the tap anchor
+        if np is not None:
+            self._ring_l = np.zeros(self._RING_FRAMES, dtype=np.float32)
+            self._ring_r = np.zeros(self._RING_FRAMES, dtype=np.float32)
+            self._spec = np.zeros(self._SPEC_BINS, dtype=np.float32)
+            self._spec_hann = np.hanning(self._SPEC_FRAME)
+            edges = np.logspace(np.log10(self._SPEC_F0),
+                                np.log10(self._SPEC_F1),
+                                self._SPEC_BINS + 1)
+            self._spec_edges = np.clip(
+                (edges * self._SPEC_FRAME / self._SR).astype(int),
+                0, self._SPEC_FRAME // 2).tolist()
+        else:
+            self._ring_l = None
+            self._ring_r = None
+            self._spec = None
+            self._spec_hann = None
+            self._spec_edges = None
+        self._samp_pos = 0
+        self._samp_count = 0
+        self._frames_consumed = 0  # total PCM frames consumed since reset
+        self._vu_l = 0.0
+        self._vu_r = 0.0
+        self._vu_l_target = 0.0
+        self._vu_r_target = 0.0
+
     # ---------------------------------------------------------------- API
     def set_track(self, filepath):
-        """Start (or keep) showing the waveform for this file."""
+        """Start (or keep) showing the visualizer for this file."""
         filepath = Path(filepath)
         if filepath == self._track_path:
             return
@@ -1052,6 +1309,7 @@ class WaveformVisualizer(QWidget):
         self._worker = _WaveformWorker(self._generation, filepath)
         self._worker.done.connect(self._on_peaks_ready)
         self._worker.start()
+        self.set_audio_track(filepath)
         self.update()
 
     def clear(self):
@@ -1060,26 +1318,176 @@ class WaveformVisualizer(QWidget):
         self._generation += 1
         self._peaks = []
         self._playing = False
+        self.stop_audio_tap()
         self._timer.stop()
         self.update()
 
     def set_playing(self, playing: bool):
-        """Start/stop the animation timer with the playback state."""
+        """Run/pause the animation with the playback state."""
         if playing == self._playing:
             return
-        self._playing = playing
         if playing:
+            self._playing = True
             if not self._offset_init:
                 # fresh track: the position starts at zero NOW (the anchor
                 # set in set_track may predate the actual playback start)
                 self._anchor_pos = 0.0
                 self._anchor_time = self._clock.elapsed()
             self._next_frame = self._clock.elapsed() + self._FRAME_PERIOD
-            if self._peaks:
-                self._timer.start()
         else:
-            self._timer.stop()
+            # Pause: FREEZE — fold the elapsed time (and correction) into
+            # the anchor so the displayed position stays exactly where it
+            # is, and resuming continues from there without a jump.
+            self._anchor_pos = self._current_position()
+            self._anchor_time = self._clock.elapsed()
+            self._offset = 0.0
+            self._playing = False
+        self.set_audio_playing(playing)
+        self._timer_policy()
         self.update()
+
+    # -------------------------------------------------- visualizer mode API
+    def mode(self) -> str:
+        return self._mode
+
+    def set_mode(self, mode: str):
+        """Switch the visualizer (from the config file at startup)."""
+        if mode in self.MODES:
+            self._mode = mode
+            self.update()
+
+    def cycle_mode(self):
+        """Advance to the next visualizer (called on click)."""
+        self._mode = self.MODES[(self.MODES.index(self._mode) + 1)
+                                % len(self.MODES)]
+        self.update()
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.cycle_mode()
+        super().mousePressEvent(event)
+
+    # ---------------------------------------------------------- audio tap API
+    def _tap_enabled(self, path: Optional[Path] = None) -> bool:
+        path = path if path is not None else self._tap_path
+        return (np is not None
+                and av is not None
+                and path is not None
+                and Path(path).exists())
+
+    def set_audio_track(self, filepath):
+        """Remember the track for the live PCM tap (position 0).
+
+        The in-process decoder itself only runs while audio is actually
+        playing (see set_audio_playing) — zero decode CPU otherwise.
+        """
+        filepath = Path(filepath)
+        if filepath == self._tap_path:
+            return
+        self._reset_audio_state()
+        self._tap_path = filepath
+
+    def set_audio_playing(self, playing: bool):
+        """Keep the in-process decoder in step with the player's play/pause.
+
+        Pausing STOPS the decoder (no decode CPU while paused); the file
+        position is remembered and resume restarts the decoder there.
+        """
+        if not self._tap_enabled():
+            return
+        if playing:
+            if not self._tap_active:
+                self._start_tap_at(self._tap_path,
+                                   self._tap_file_position_ms())
+            else:
+                # The decoder has been head-decoding since playback
+                # (re)started: re-anchor the pacing to NOW so the tap
+                # follows the player's (re)start, not the earlier one.
+                self._tap_anchor_time = self._clock.elapsed()
+        elif self._tap_active:
+            self._tap_offset_ms = self._tap_file_position_ms()
+            self._tap.close_track()
+            self._tap_active = False
+
+    def seek_audio(self, pos_ms: int):
+        """Follow a player seek so the tap stays on the right audio."""
+        if not self._tap_enabled():
+            return
+        if self._tap_active:
+            self._start_tap_at(self._tap_path, int(pos_ms))
+        else:
+            # paused: remember where to resume from
+            self._tap_offset_ms = float(max(0, pos_ms))
+
+    def stop_audio_tap(self):
+        """Stop the tap and forget the file (no-track state)."""
+        self._reset_audio_state()
+        self._tap_path = None
+        if self._tap_active:
+            self._tap.close_track()
+            self._tap_active = False
+
+    def _start_tap_at(self, path, offset_ms: float):
+        self._tap.open_track(path, offset_ms)
+        self._tap_offset_ms = float(offset_ms)
+        self._tap_anchor_time = self._clock.elapsed()
+        self._tap_active = True
+
+    def _reset_audio_state(self):
+        if self._tap_active:
+            self._tap.close_track()
+            self._tap_active = False
+        self._tap_offset_ms = 0.0
+        self._tap_anchor_time = self._clock.elapsed()
+        self._samp_pos = 0
+        self._samp_count = 0
+        self._frames_consumed = 0
+        self._vu_l = 0.0
+        self._vu_r = 0.0
+        self._vu_l_target = 0.0
+        self._vu_r_target = 0.0
+        if self._ring_l is not None:
+            self._ring_l.fill(0)
+            self._ring_r.fill(0)
+        if self._spec is not None:
+            self._spec.fill(0)
+
+    def _tap_file_position_ms(self) -> float:
+        """Where the tap currently sits in the file (ms)."""
+        if not self._tap_active:
+            return self._tap_offset_ms
+        elapsed_s = (self._clock.elapsed() - self._tap_anchor_time) / 1000.0
+        return self._tap_offset_ms + elapsed_s * 1000.0
+
+    def feed_samples(self, samples):
+        """Ingest stereo float32 PCM of shape (n, 2) — the tap calls this,
+        and tests may call it directly with synthetic audio."""
+        if self._ring_l is None or samples is None or len(samples) == 0:
+            return
+        n = len(samples)
+        if n >= self._RING_FRAMES:
+            samples = samples[-self._RING_FRAMES:]
+            n = self._RING_FRAMES
+        l = samples[:, 0]
+        r = samples[:, 1]
+        pos = self._samp_pos
+        size = self._RING_FRAMES
+        if pos + n > size:
+            first = size - pos
+            self._ring_l[pos:] = l[:first]
+            self._ring_r[pos:] = r[:first]
+            self._ring_l[:n - first] = l[first:]
+            self._ring_r[:n - first] = r[first:]
+        else:
+            self._ring_l[pos:pos + n] = l
+            self._ring_r[pos:pos + n] = r
+        self._samp_pos = (pos + n) % size
+        self._samp_count = min(self._samp_count + n, size)
+        # VU: per-chunk peaks (fast attack happens on feed)
+        self._vu_l_target = max(self._vu_l_target,
+                                float(np.max(np.abs(l))))
+        self._vu_r_target = max(self._vu_r_target,
+                                float(np.max(np.abs(r))))
 
     def note_position(self, pos_ms: int):
         """Feed a player position report (from positionChanged).
@@ -1104,13 +1512,21 @@ class WaveformVisualizer(QWidget):
                 self._anchor_pos = float(pos_ms)
                 self._anchor_time = now
                 self._offset = 0.0
+                self.seek_audio(pos_ms)  # resync the audio tap to the seek
             else:
                 self._offset += (dev - self._offset) * self._ALPHA
         else:
-            self._anchor_pos = float(pos_ms)
-            self._anchor_time = now
-            self._offset = 0.0
-            self._offset_init = False
+            # Paused: adopt forward reports (buffer drain / seek forward)
+            # and well-behind reports (a real seek back); a report that is
+            # slightly behind is a stale sample from the just-paused buffer
+            # and is ignored so the frozen position holds.
+            cur = self._current_position()
+            if float(pos_ms) > cur or cur - float(pos_ms) > self._PAUSED_STALE_MS:
+                self._anchor_pos = float(pos_ms)
+                self._anchor_time = now
+                self._offset = 0.0
+                self._offset_init = True
+                self.seek_audio(pos_ms)
         if not self._playing or not self._timer.isActive():
             self.update()
 
@@ -1121,7 +1537,7 @@ class WaveformVisualizer(QWidget):
         self._peaks = peaks
         if self._playing:
             self._next_frame = self._clock.elapsed() + self._FRAME_PERIOD
-            self._timer.start()
+        self._timer_policy()
         self.update()
 
     def _current_position(self):
@@ -1132,6 +1548,20 @@ class WaveformVisualizer(QWidget):
             pos += self._clock.elapsed() - self._anchor_time
         pos += self._offset
         return max(0.0, pos)
+
+    def _timer_policy(self):
+        """The 60 FPS timer runs only while something is animating:
+        playback (waveform scroll / live audio) or VU/spectrum decays
+        still settling after a pause."""
+        needed = self._playing
+        if not needed and self._spec is not None:
+            needed = (self._vu_l > 0.002 or self._vu_r > 0.002
+                      or bool(self._spec.max() > 0.002))
+        if needed and not self._timer.isActive():
+            self._next_frame = self._clock.elapsed() + self._FRAME_PERIOD
+            self._timer.start()
+        elif not needed and self._timer.isActive():
+            self._timer.stop()
 
     def _tick(self):
         # Draw on a drift-corrected 60 FPS grid: uniform frame spacing
@@ -1144,7 +1574,92 @@ class WaveformVisualizer(QWidget):
             self._next_frame = now + self._FRAME_PERIOD
         else:
             self._next_frame += self._FRAME_PERIOD
+        self._frame_update()
         self.update()
+
+    def _frame_update(self):
+        """Per-frame (60 FPS) state work: paced tap consumption, VU
+        release, spectrum update/decay. All numpy ops are tiny (a 4096
+        point FFT plus a few vector passes)."""
+        # 1) pull decoded PCM up to the present (realtime paced)
+        if self._tap_active and self._playing and self._tap_path is not None:
+            if not self._tap.alive():
+                # the decoder died (open/decode error): forget it
+                self._tap_active = False
+            else:
+                now = self._clock.elapsed()
+                due = ((now - self._tap_anchor_time) / 1000.0
+                       * self._RATE_BPS)
+                # frame-aligned: one stereo float32 frame is 8 bytes
+                n = (min(int(due), self._tap.pending()) // 8) * 8
+                if n > 0:
+                    data = self._tap.drain(n)
+                    samples = np.frombuffer(data, dtype=np.float32)
+                    samples = np.ascontiguousarray(samples.reshape(-1, 2))
+                    self.feed_samples(samples)
+                    self._frames_consumed += len(samples)
+                    self._tap_offset_ms += len(data) / self._RATE_BPS * 1000.0
+                    self._tap_anchor_time = now
+
+        # 2) VU release (fast attack already applied on feed)
+        self._vu_l = max(self._vu_l_target, self._vu_l * self._VU_DECAY)
+        self._vu_r = max(self._vu_r_target, self._vu_r * self._VU_DECAY)
+        self._vu_l_target = 0.0
+        self._vu_r_target = 0.0
+
+        # 3) spectrum: live while playing, decaying otherwise
+        if self._spec is not None:
+            if self._playing and self._samp_count >= self._SPEC_FRAME:
+                self._update_spectrum()
+            elif not self._playing and bool(self._spec.max() > 0.0):
+                self._spec *= self._SPEC_DECAY
+
+        self._timer_policy()
+
+    def _update_spectrum(self):
+        """Log-spaced bin magnitudes of the last 4096 samples, with fast
+        attack / slow release smoothing."""
+        mono = self._ring_mono(self._SPEC_FRAME)
+        if mono is None:
+            return
+        mag = np.abs(np.fft.rfft(mono * self._spec_hann))
+        # max per log-frequency bin (edges are monotonic ints)
+        reduced = np.maximum.reduceat(mag, self._spec_edges[:-1])
+        db = 20.0 * np.log10(reduced + 1e-7)
+        target = np.clip((db + 70.0) / 60.0, 0.0, 1.0).astype(np.float32)
+        prev = self._spec
+        self._spec = np.where(
+            target > prev,
+            prev + (target - prev) * 0.5,   # fast attack
+            prev + (target - prev) * 0.15)  # slow release
+
+    def _ring_slice(self, n: int):
+        """The last n frames (l, r) from the ring, oldest first."""
+        size = self._RING_FRAMES
+        n = min(n, self._samp_count, size)
+        if n <= 0:
+            return None
+        start = (self._samp_pos - n) % size
+        if start + n <= size:
+            l = self._ring_l[start:start + n]
+            r = self._ring_r[start:start + n]
+        else:
+            first = size - start
+            l = np.concatenate((self._ring_l[start:],
+                                self._ring_l[:n - first]))
+            r = np.concatenate((self._ring_r[start:],
+                                self._ring_r[:n - first]))
+        return l, r
+
+    def _ring_mono(self, n: int):
+        sl = self._ring_slice(n)
+        if sl is None:
+            return None
+        return (sl[0] + sl[1]) * 0.5
+
+    def scope_array(self):
+        """The last _SCOPE_N mono samples (for the oscilloscope), or None."""
+        return self._ring_mono(self._SCOPE_N)
 
     def _band(self, painter, c_start, c_end, pf, phx, mid, scale, color):
         """Draw one played/upcoming band as a mirrored antialiased polygon.
@@ -1167,6 +1682,7 @@ class WaveformVisualizer(QWidget):
         painter.setBrush(color)
         painter.drawPolygon(poly)
 
+    # ------------------------------------------------------------- painting
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1174,11 +1690,30 @@ class WaveformVisualizer(QWidget):
         h = self.height()
         painter.fillRect(0, 0, w, h, self.BG_COLOR)
 
+        if self._mode == 'vu':
+            self._paint_vu(painter, w, h)
+        elif self._mode == 'spectrum':
+            self._paint_spectrum(painter, w, h)
+        elif self._mode == 'oscilloscope':
+            self._paint_scope(painter, w, h)
+        else:
+            self._paint_waveform(painter, w, h)
+
+        # mode label + bottom border (fillRect keeps them crisp —
+        # antialiased 1px lines at integer coords would blur to 50% gray)
+        painter.setPen(self.LABEL_COLOR)
+        painter.setFont(self._label_font)
+        painter.drawText(QRectF(w - 46, 1, 44, 11),
+                         Qt.AlignmentFlag.AlignRight
+                         | Qt.AlignmentFlag.AlignVCenter,
+                         self.MODE_LABELS[self._mode])
+        painter.fillRect(0, h - 1, w, 1, self.BORDER_COLOR)
+        painter.end()
+
+    def _paint_waveform(self, painter, w, h):
         if not self._peaks:
             # placeholder: flat line across the middle
             painter.fillRect(0, h // 2, w, 1, self.PLACEHOLDER_COLOR)
-            painter.fillRect(0, h - 1, w, 1, self.BORDER_COLOR)
-            painter.end()
             return
 
         total = len(self._peaks)
@@ -1198,11 +1733,66 @@ class WaveformVisualizer(QWidget):
         self._band(painter, ph_col + 1, c1, pf, phx, mid, scale,
                    self.DIM_COLOR)
 
-        # playhead marker + bottom border (fillRect keeps them crisp —
-        # antialiased 1px lines at integer coords would blur to 50% gray)
+        # playhead marker
         painter.fillRect(phx, 0, 1, h, self.PLAYHEAD_COLOR)
-        painter.fillRect(0, h - 1, w, 1, self.BORDER_COLOR)
-        painter.end()
+
+    def _paint_vu(self, painter, w, h):
+        """Two VU bars (L left, R right). Mono audio feeds both the same."""
+        bar_w = 44
+        gap = 12
+        top, bottom = 4, h - 4
+        height = bottom - top
+        cx = w / 2.0
+        painter.setFont(self._label_font)
+        for x, vu, letter in ((cx - gap / 2 - bar_w, self._vu_l, 'L'),
+                              (cx + gap / 2, self._vu_r, 'R')):
+            x = int(round(x))
+            painter.fillRect(x, top, int(bar_w), height,
+                             QColor('#2a2a2a'))
+            fill_h = int(round(min(1.0, vu) * (height - 2)))
+            if fill_h > 0:
+                painter.fillRect(x + 1, bottom - fill_h, int(bar_w) - 2,
+                                 fill_h, self.ACCENT_COLOR)
+            painter.setPen(self.LABEL_COLOR)
+            painter.drawText(QRectF(x, h - 14, bar_w, 12),
+                             Qt.AlignmentFlag.AlignCenter, letter)
+
+    def _paint_spectrum(self, painter, w, h):
+        """Frequency-bin bars: gray at the bottom, gold at the top."""
+        if self._spec is None:
+            painter.fillRect(0, h // 2, w, 1, self.PLACEHOLDER_COLOR)
+            return
+        n = self._SPEC_BINS
+        gap = 1
+        bar_w = (w - gap * (n + 1)) / n
+        gradient = QLinearGradient(0, h, 0, 0)
+        gradient.setColorAt(0.0, self.SPECTRUM_BASE_COLOR)
+        gradient.setColorAt(1.0, self.ACCENT_COLOR)
+        brush = QBrush(gradient)
+        for i in range(n):
+            v = float(self._spec[i])
+            if v <= 0.01:
+                continue
+            bh = max(1, int(round(v * (h - 6))))
+            x = int(gap + i * (bar_w + gap))
+            bw = int(bar_w)
+            painter.fillRect(x, h - 2 - bh, bw, bh, brush)
+
+    def _paint_scope(self, painter, w, h):
+        """The current audio waveform, like a real oscilloscope."""
+        mid = h / 2.0
+        painter.fillRect(0, int(mid), w, 1, QColor('#333333'))  # axis
+        mono = self.scope_array()
+        if mono is None or len(mono) < 2:
+            return
+        n = len(mono)
+        step = (w - 1) / (n - 1)
+        amp = h / 2.0 - 3
+        poly = QPolygonF()
+        for i in range(n):
+            poly.append(QPointF(i * step, mid - float(mono[i]) * amp))
+        painter.setPen(QPen(self.ACCENT_COLOR, 1.4))
+        painter.drawPolyline(poly)
 
 
 class TrackInfoPanel(QWidget):
@@ -1360,7 +1950,22 @@ class Musibisk(QMainWindow):
         
         # State
         self.playlist: List[Path] = []
+        # The view the UI and playback actually use: all songs, or (when
+        # saved_only is on) just the saved ones. current_index is an index
+        # into visible_songs, never into playlist.
+        self.visible_songs: List[Path] = []
+        self.saved_only: bool = False
         self.current_index: int = -1
+        # Per-song info caches: reading each file's tags (name/length/saved
+        # flag) on every playlist rebuild is what made large lists lag.
+        # These are populated on first read and invalidated whenever a file
+        # is added/removed/deleted or its saved state is toggled.
+        self._name_cache: dict = {}
+        self._length_cache: dict = {}
+        self._saved_cache: dict = {}
+        # Chunked playlist rebuild state (see _rebuild_playlist_widget)
+        self._rebuild_token: int = 0
+        self._rebuild_in_progress: bool = False
         self.loop_mode = LoopMode.NO_LOOP
         self.play_order = PlayOrder.OLDEST_TO_NEWEST
         self.target_directory: Optional[Path] = None
@@ -1588,6 +2193,13 @@ class Musibisk(QMainWindow):
         self.delete_button.clicked.connect(self.handle_delete_click)
         self.delete_button.setToolTip("Double-click to delete song")
         
+        # Saved-only filter button (trophy), right of the delete button
+        self.saved_only_button = GlyphCenteredButton("🏆")
+        self.saved_only_button.setStyleSheet(BUTTON_FONT_SIZE)
+        self.saved_only_button.setFixedSize(button_size, button_size)
+        self.saved_only_button.clicked.connect(self.toggle_saved_only)
+        self.saved_only_button.setToolTip("Show only saved songs (Ctrl+F)")
+        
         self.volume_slider = QSlider(Qt.Orientation.Vertical)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(int(self.audio_output.volume() * 100))
@@ -1617,6 +2229,7 @@ class Musibisk(QMainWindow):
         controls_layout.addWidget(separator)
         controls_layout.addWidget(self.save_button)
         controls_layout.addWidget(self.delete_button)
+        controls_layout.addWidget(self.saved_only_button)
         controls_layout.addWidget(separator)
         controls_layout.addWidget(self.volume_slider)
         controls_layout.addStretch()
@@ -1791,8 +2404,8 @@ class Musibisk(QMainWindow):
         """Refresh the track info panel for the current (or absent) track."""
         if self.info_panel is None:
             return
-        if 0 <= self.current_index < len(self.playlist):
-            self.info_panel.set_track(self.playlist[self.current_index])
+        if 0 <= self.current_index < len(self.visible_songs):
+            self.info_panel.set_track(self.visible_songs[self.current_index])
         else:
             self.info_panel.clear()
 
@@ -1822,6 +2435,7 @@ class Musibisk(QMainWindow):
         self.addAction(self.create_shortcut("Space", self.toggle_play_pause))
         self.addAction(self.create_shortcut("Right", self.next_song))
         self.addAction(self.create_shortcut("Left", self.previous_song))
+        self.addAction(self.create_shortcut("Ctrl+F", self.toggle_saved_only))
     
     def create_shortcut(self, key: str, callback):
         """Helper to create keyboard shortcuts"""
@@ -1893,44 +2507,205 @@ class Musibisk(QMainWindow):
         # Save config
         self.save_config()
     
+    def _rebuild_visible_songs(self):
+        """(Re)compute the playlist view the UI and playback use."""
+        if self.saved_only:
+            self.visible_songs = [
+                p for p in self.playlist if self.is_song_saved(p)]
+        else:
+            # alias: incremental playlist edits stay in sync automatically
+            self.visible_songs = self.playlist
+
+    # Small lists build in one go; bigger ones stream in across event-loop
+    # passes (a handful of rows per pass) so the UI never freezes and the
+    # rows appear in realtime as they are enumerated.
+    _REBUILD_SYNC_MAX = 150
+    _REBUILD_CHUNK = 32
+
+    def _rebuild_playlist_widget(self):
+        """Repopulate the playlist table from the visible view."""
+        self._rebuild_token += 1  # cancels any chunked build in flight
+        token = self._rebuild_token
+        if len(self.visible_songs) <= self._REBUILD_SYNC_MAX:
+            self.playlist_widget.setRowCount(0)
+            self._rebuild_in_progress = False
+            for f in self.visible_songs:
+                self.add_to_playlist_widget(f)
+            self._after_playlist_rebuild()
+            return
+        self.playlist_widget.setRowCount(0)
+        self._rebuild_in_progress = True
+        QTimer.singleShot(0, lambda: self._rebuild_chunk(token))
+
+    def _rebuild_chunk(self, token: int):
+        """Add the next batch of rows; reschedule until the list is full.
+        A newer rebuild bumps _rebuild_token, which stops this loop."""
+        if token != self._rebuild_token:
+            return
+        total = len(self.visible_songs)
+        rows = self.playlist_widget.rowCount()
+        end = min(rows + self._REBUILD_CHUNK, total)
+        for i in range(rows, end):
+            self.add_to_playlist_widget(self.visible_songs[i])
+        if self.playlist_widget.rowCount() < total:
+            QTimer.singleShot(0, lambda: self._rebuild_chunk(token))
+        else:
+            self._rebuild_in_progress = False
+            self._after_playlist_rebuild()
+
+    def _after_playlist_rebuild(self):
+        """Highlight the current row once the (possibly chunked) rebuild
+        has finished — the rows may not exist yet mid-stream."""
+        if not self._rebuild_in_progress and self.current_index >= 0:
+            self.highlight_current_song()
+
+    def _next_seq_index(self, index: int, count: int) -> int:
+        """Next index in the playback sequence (same rules as
+        get_next_index, but for an explicit index/count)."""
+        if count == 0:
+            return -1
+        if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
+            return (index + 1) % count
+        next_idx = index - 1
+        if next_idx < 0:
+            next_idx = count - 1
+        return next_idx
+
+    def _clear_current_song(self):
+        """Drop the current selection (no song loaded state)"""
+        self.current_index = -1
+        self.song_label.setText("No song loaded")
+        self.play_pause_button.setText("▶")
+        self._update_track_info()
+        self.highlight_current_song()
+
+    def _apply_saved_only_filter(self):
+        """Rebuild the visible playlist after the saved-only filter (or a
+        song's saved state) changed.
+
+        - If the current song survives, keep playing/paused exactly where
+          it was and just remap its (moved) index.
+        - If it drops out, the next song is the next saved song in the
+          playback sequence; playback continues if it was running.
+        - If nothing was selected, pick the normal starting song.
+        """
+        was_playing = (self.player.playbackState()
+                       == QMediaPlayer.PlaybackState.PlayingState)
+        old_visible = self.visible_songs
+        old_index = self.current_index
+        current_file = (old_visible[old_index]
+                        if 0 <= old_index < len(old_visible) else None)
+
+        self._rebuild_visible_songs()
+        survived = (current_file is not None
+                    and current_file in self.visible_songs)
+
+        # next song in the sequence that remains visible (for the case the
+        # current song drops out of the filtered view)
+        next_file = None
+        if current_file is not None and not survived:
+            i, n = old_index, len(old_visible)
+            for _ in range(n):
+                i = self._next_seq_index(i, n)
+                candidate = old_visible[i]
+                if candidate in self.visible_songs:
+                    next_file = candidate
+                    break
+
+        self._rebuild_playlist_widget()
+
+        if survived:
+            self.current_index = self.visible_songs.index(current_file)
+            self.highlight_current_song()
+        elif current_file is not None:
+            self.player.stop()
+            if next_file is not None:
+                self.current_index = self.visible_songs.index(next_file)
+                self.load_current_song()
+                if was_playing:
+                    self.player.play()
+                    self.play_pause_button.setText("⏸")
+                else:
+                    self.play_pause_button.setText("▶")
+            else:
+                self._clear_current_song()
+        elif self.visible_songs:
+            self.current_index = self.get_starting_index()
+            self.load_current_song()
+            self.highlight_current_song()
+
+        self.reset_delete_state()
+        self.update_save_button()
+
+    def toggle_saved_only(self):
+        """Toggle the 'saved songs only' playlist filter (trophy button /
+        Ctrl+F)."""
+        self.saved_only = not self.saved_only
+        self.update_saved_only_button()
+        self.save_config()
+        self._apply_saved_only_filter()
+
+    def update_saved_only_button(self):
+        """Highlight the trophy button while the filter is on"""
+        if self.saved_only:
+            self.saved_only_button.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: #C38C31;
+                    color: #ffffff;
+                    border: 1px solid #3d3d3d;
+                    border-radius: 10px;
+                    {BUTTON_FONT_SIZE}
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: #ECAA40;
+                    border: 1px solid #4d4d4d;
+                }}
+                QPushButton:pressed {{
+                    background-color: #ECAA40;
+                }}
+            """)
+        else:
+            self.saved_only_button.setStyleSheet(BUTTON_FONT_SIZE)
+
     def get_next_index(self):
         """Get the next song index based on play order"""
-        if not self.playlist:
+        if not self.visible_songs:
             return -1
         
         if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
             # Moving forward through the list (bottom to top in display)
-            return (self.current_index + 1) % len(self.playlist)
+            return (self.current_index + 1) % len(self.visible_songs)
         else:  # NEWEST_TO_OLDEST
             # Moving backward through the list (top to bottom in display)
             next_idx = self.current_index - 1
             if next_idx < 0:
-                next_idx = len(self.playlist) - 1
+                next_idx = len(self.visible_songs) - 1
             return next_idx
     
     def get_previous_index(self):
         """Get the previous song index based on play order"""
-        if not self.playlist:
+        if not self.visible_songs:
             return -1
         
         if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
             # Moving backward through the list (top to bottom in display)
             prev_idx = self.current_index - 1
             if prev_idx < 0:
-                prev_idx = len(self.playlist) - 1
+                prev_idx = len(self.visible_songs) - 1
             return prev_idx
         else:  # NEWEST_TO_OLDEST
             # Moving forward through the list (bottom to top in display)
-            return (self.current_index + 1) % len(self.playlist)
+            return (self.current_index + 1) % len(self.visible_songs)
     
     def get_starting_index(self):
         """Get the index to start playing from based on play order"""
-        if not self.playlist:
+        if not self.visible_songs:
             return -1
         
         if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
             # Start at the end (oldest song, which is at bottom)
-            return len(self.playlist) - 1
+            return len(self.visible_songs) - 1
         else:  # NEWEST_TO_OLDEST
             # Start at the beginning (newest song, which is at top)
             return 0
@@ -1952,15 +2727,20 @@ class Musibisk(QMainWindow):
         
         # Clear playlist and add files
         self.playlist.clear()
-        self.playlist_widget.setRowCount(0)
+        self._name_cache.clear()
+        self._length_cache.clear()
+        self._saved_cache.clear()
         
         # Add files in order (most recent first, so they appear at top)
         for file in files:
             self.playlist.append(file)
-            self.add_to_playlist_widget(file)
+        
+        # Refresh the view and the table
+        self._rebuild_visible_songs()
+        self._rebuild_playlist_widget()
         
         # Start playing from the appropriate position based on play order
-        if self.playlist and self.current_index == -1:
+        if self.visible_songs and self.current_index == -1:
             self.current_index = self.get_starting_index()
             self.load_current_song()
             self.highlight_current_song()
@@ -1969,18 +2749,30 @@ class Musibisk(QMainWindow):
         """Add a new file to the playlist"""
         path = Path(filepath)
         if path not in self.playlist:
-            # Insert at the beginning (top) of the playlist
+            # The file on disk may be new (or different from one that was
+            # here before): forget any cached info for this path
+            self._invalidate_song_caches(path)
+            # Insert at the beginning (top) of the canonical playlist
             self.playlist.insert(0, path)
-            self.add_to_playlist_widget_at_top(path)
+            self._rebuild_visible_songs()
             
-            # Adjust current index if necessary
-            if self.current_index >= 0:
-                self.current_index += 1
-                # Update the highlighted row to match the new index
-                self.highlight_current_song()
+            # Only unsaved songs are hidden by the saved-only filter
+            if path in self.visible_songs:
+                # Adjust current index if necessary
+                if self.current_index >= 0:
+                    self.current_index += 1
+                if self._rebuild_in_progress:
+                    # A chunked rebuild is streaming in: restart it so the
+                    # new row lands in the right place (in order)
+                    self._rebuild_playlist_widget()
+                else:
+                    self.add_to_playlist_widget_at_top(path)
+                    # Update the highlighted row to match the new index
+                    if self.current_index >= 0:
+                        self.highlight_current_song()
             
             # If nothing is playing, start playing from the appropriate position
-            if self.current_index == -1:
+            if self.current_index == -1 and self.visible_songs:
                 self.current_index = self.get_starting_index()
                 self.load_current_song()
                 self.highlight_current_song()
@@ -1994,40 +2786,47 @@ class Musibisk(QMainWindow):
         if path not in self.playlist:
             return
         
-        index = self.playlist.index(path)
+        was_visible = path in self.visible_songs
+        index = self.visible_songs.index(path) if was_visible else -1
         was_current = (index == self.current_index)
         
         # Keep the remote consistent: if it was a saved song, remove it
         # from the server (no-op there if it doesn't exist). The file is
-        # already gone, so the saved state comes from the row's cached
-        # flag (kept in sync by toggle_save_song), not the tag.
-        item = self.playlist_widget.item(index, 0)
+        # already gone, so the saved state comes from the row's cached flag
+        # (kept in sync by toggle_save_song) — not a fresh tag read.
+        item = (self.playlist_widget.item(index, 0)
+                if was_visible else None)
         was_saved = (bool(item.data(Qt.ItemDataRole.UserRole + 1))
                      if item is not None else self.is_song_saved(path))
         if was_saved:
             self.sync_remove(self.get_remote_name(path))
         
-        del self.playlist[index]
-        self.playlist_widget.removeRow(index)
+        self._invalidate_song_caches(path)
+        self.playlist.remove(path)
+        self._rebuild_visible_songs()
+        if was_visible:
+            if self._rebuild_in_progress:
+                # mid-stream rebuild: let a fresh rebuild place everything
+                self._rebuild_playlist_widget()
+            else:
+                self.playlist_widget.removeRow(index)
         
         if was_current:
             self.player.stop()
-            if self.playlist:
+            if self.visible_songs:
                 # The next song slid into this index
-                if self.current_index >= len(self.playlist):
+                if self.current_index >= len(self.visible_songs):
                     self.current_index = 0
                 self.load_current_song()
                 self.player.play()
                 self.play_pause_button.setText("⏸")
             else:
-                self.current_index = -1
-                self.song_label.setText("No song loaded")
-                self.play_pause_button.setText("▶")
-                self._update_track_info()
+                self._clear_current_song()
         else:
-            if index < self.current_index:
+            if was_visible and index < self.current_index:
                 self.current_index -= 1
-            self.highlight_current_song()
+            if self.current_index >= 0:
+                self.highlight_current_song()
     
     def get_formatted_timestamp(self, filepath: Path) -> str:
         """Get formatted timestamp for file modification time"""
@@ -2039,14 +2838,47 @@ class Musibisk(QMainWindow):
             return "Unknown"
 
     def get_song_length(self, filepath: Path) -> str:
-        """Get formatted length (M:SS) of an audio file"""
+        """Get formatted length (M:SS) of an audio file (cached)."""
+        return self._cached_song(self._length_cache, filepath,
+                                 self._read_song_length)
+
+    def _read_song_length(self, filepath: Path) -> str:
+        length = "?"
         try:
             audio = mutagen.File(filepath)
             if audio and audio.info:
-                return self.format_time(int(audio.info.length * 1000))
+                length = self.format_time(int(audio.info.length * 1000))
         except:
             pass
-        return "?"
+        return length
+
+    def _cached_song(self, cache: dict, filepath: Path, reader) -> str:
+        """Memoize reader(filepath) on the file's mtime.
+
+        A stat() is cheap, so unchanged files cost nothing (no tag parse)
+        on every access, while an external rewrite of the file bumps its
+        mtime and is picked up automatically. Cache values are (mtime,
+        value) tuples keyed by path."""
+        hit = cache.get(filepath)
+        try:
+            mtime = filepath.stat().st_mtime
+        except OSError:
+            # File is gone: return the last known value (the file may have
+            # been deleted out from under us) rather than re-reading.
+            if hit is not None:
+                return hit[1]
+            return reader(filepath)
+        if hit is not None and hit[0] == mtime:
+            return hit[1]
+        value = reader(filepath)
+        cache[filepath] = (mtime, value)
+        return value
+
+    def _invalidate_song_caches(self, filepath: Path):
+        """Forget cached info for one file (it was added/removed/deleted)."""
+        self._name_cache.pop(filepath, None)
+        self._length_cache.pop(filepath, None)
+        self._saved_cache.pop(filepath, None)
     
     def add_to_playlist_widget(self, filepath: Path):
         """Add a song to the playlist widget (at the end)"""
@@ -2113,8 +2945,8 @@ class Musibisk(QMainWindow):
         if item:
             filepath = item.data(Qt.ItemDataRole.UserRole)
             try:
-                index = self.playlist.index(filepath)
-                
+                index = self.visible_songs.index(filepath)
+
                 # Store current scroll position
                 scrollbar = self.playlist_widget.verticalScrollBar()
                 scroll_pos = scrollbar.value()
@@ -2141,8 +2973,8 @@ class Musibisk(QMainWindow):
     
     def load_current_song(self):
         """Load the current song into the player"""
-        if 0 <= self.current_index < len(self.playlist):
-            filepath = self.playlist[self.current_index]
+        if 0 <= self.current_index < len(self.visible_songs):
+            filepath = self.visible_songs[self.current_index]
             self.player.setSource(QUrl.fromLocalFile(str(filepath)))
             
             # Update song label with metadata or filename
@@ -2159,7 +2991,12 @@ class Musibisk(QMainWindow):
             self._update_track_info()
     
     def get_song_name(self, filepath: Path) -> str:
-        """Extract song name from metadata or use filename"""
+        """Extract song name from metadata or use filename (cached)."""
+        return self._cached_song(self._name_cache, filepath,
+                                 self._read_song_name)
+
+    def _read_song_name(self, filepath: Path) -> str:
+        """Read the song name straight from the file (no cache)."""
         try:
             audio = mutagen.File(filepath)
             if audio and audio.tags:
@@ -2181,8 +3018,11 @@ class Musibisk(QMainWindow):
         return filepath.stem
     
     def is_song_saved(self, filepath: Path) -> bool:
-        """Check if a song is marked as saved (embedded metadata tag)"""
-        return read_saved_tag(filepath)
+        """Check if a song is marked as saved (embedded metadata tag).
+        Memoized on mtime (see _cached_song): cheap for unchanged files,
+        and an external re-tag bumps mtime so it is picked up."""
+        return self._cached_song(self._saved_cache, filepath,
+                                 read_saved_tag)
     
     def handle_volume_slider(self, value):
         """Handle volume slider value change"""
@@ -2252,10 +3092,10 @@ class Musibisk(QMainWindow):
     def toggle_save_song(self):
         """Toggle the save status of the current song (embedded tag; the
         filename never changes)"""
-        if self.current_index < 0 or self.current_index >= len(self.playlist):
+        if self.current_index < 0 or self.current_index >= len(self.visible_songs):
             return
         
-        current_file = self.playlist[self.current_index]
+        current_file = self.visible_songs[self.current_index]
         
         if not current_file.exists():
             return
@@ -2264,6 +3104,9 @@ class Musibisk(QMainWindow):
         if not set_saved_tag(current_file, now_saved):
             self._show_status("Could not update saved status", 3000)
             return
+        # The tag write bumped mtime; drop the stale cache entry so the
+        # next read re-parses and re-caches under the new mtime.
+        self._saved_cache.pop(current_file, None)
         
         self._show_status(
             f"Song saved: {current_file.name}" if now_saved
@@ -2283,11 +3126,16 @@ class Musibisk(QMainWindow):
             self.sync_upload(current_file, self.get_remote_name(current_file))
         else:
             self.sync_remove(self.get_remote_name(current_file))
+        
+        if self.saved_only and not now_saved:
+            # This song just dropped out of the saved-only playlist:
+            # the next song to play is the next saved one in the sequence
+            self._apply_saved_only_filter()
     
     def update_save_button(self):
         """Update save button appearance based on current song's save status"""
-        if self.current_index >= 0 and self.current_index < len(self.playlist):
-            current_file = self.playlist[self.current_index]
+        if self.current_index >= 0 and self.current_index < len(self.visible_songs):
+            current_file = self.visible_songs[self.current_index]
             if self.is_song_saved(current_file):
                 self.save_button.setStyleSheet(f"""
                     QPushButton {{
@@ -2339,10 +3187,11 @@ class Musibisk(QMainWindow):
     
     def delete_current_song(self):
         """Delete the current song file and move to next"""
-        if self.current_index < 0 or self.current_index >= len(self.playlist):
+        if (self.current_index < 0
+                or self.current_index >= len(self.visible_songs)):
             return
         
-        current_file = self.playlist[self.current_index]
+        current_file = self.visible_songs[self.current_index]
         
         if not current_file.exists():
             return
@@ -2358,31 +3207,30 @@ class Musibisk(QMainWindow):
             
             # Delete the file
             current_file.unlink()
+            self._invalidate_song_caches(current_file)
             
             # Remote sync: remove from remote server if it exists
             self.sync_remove(self.get_remote_name(current_file))
             
-            # Remove from playlist
-            del self.playlist[self.current_index]
-            self.playlist_widget.removeRow(self.current_index)
+            # Remove from the canonical playlist and the visible view.
+            # When the filter is off, visible_songs aliases playlist, so
+            # remove only ONCE (a second removal would eat the next song).
+            if self.visible_songs is self.playlist:
+                del self.visible_songs[self.current_index]
+            else:
+                self.playlist.remove(current_file)
+                del self.visible_songs[self.current_index]
+            if self._rebuild_in_progress:
+                self._rebuild_playlist_widget()
+            else:
+                self.playlist_widget.removeRow(self.current_index)
             
-            # Move to next song or stop if no more songs
-            if self.playlist:
-                # Determine next index based on play order
-                if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
-                    # Playing bottom-to-top (increasing indices)
-                    # After deletion, current_index now points to what was the next song
-                    # If we deleted the last song, wrap to beginning
-                    if self.current_index >= len(self.playlist):
-                        self.current_index = 0
-                    # Otherwise current_index is already pointing at the next song
-                else:  # NEWEST_TO_OLDEST
-                    # Playing top-to-bottom (decreasing indices)
-                    # After deletion at position N, the song that was at N+1 is now at N
-                    # We want to continue downward, so stay at current_index
-                    # But if we deleted at the bottom, go to top
-                    if self.current_index >= len(self.playlist):
-                        self.current_index = 0
+            # Move to next song or stop if no more songs. After removal,
+            # current_index points at whatever slid into its place; wrap
+            # if we deleted the last row.
+            if self.visible_songs:
+                if self.current_index >= len(self.visible_songs):
+                    self.current_index = 0
                 
                 # Load and play next song
                 self.load_current_song()
@@ -2390,10 +3238,7 @@ class Musibisk(QMainWindow):
                 self.play_pause_button.setText("⏸")
             else:
                 # No more songs
-                self.current_index = -1
-                self.song_label.setText("No song loaded")
-                self.play_pause_button.setText("▶")
-                self._update_track_info()
+                self._clear_current_song()
             
         except Exception as e:
             print(f"Error deleting file: {e}")
@@ -2404,7 +3249,7 @@ class Musibisk(QMainWindow):
             self.player.pause()
             self.play_pause_button.setText("▶")
         else:
-            if self.current_index == -1 and self.playlist:
+            if self.current_index == -1 and self.visible_songs:
                 self.current_index = self.get_starting_index()
                 self.load_current_song()
             self.player.play()
@@ -2412,7 +3257,7 @@ class Musibisk(QMainWindow):
     
     def next_song(self):
         """Skip to next song"""
-        if not self.playlist:
+        if not self.visible_songs:
             return
         
         if self.loop_mode == LoopMode.LOOP_SINGLE:
@@ -2429,7 +3274,7 @@ class Musibisk(QMainWindow):
     
     def previous_song(self):
         """Go to previous song"""
-        if not self.playlist:
+        if not self.visible_songs:
             return
         
         # If more than 3 seconds into song, restart it
@@ -2467,6 +3312,8 @@ class Musibisk(QMainWindow):
     def seek(self, position):
         """Seek to position in current song"""
         self.player.setPosition(position)
+        if self.info_panel is not None:
+            self.info_panel.waveform.seek_audio(position)
     
     def update_position(self, position):
         """Update position display"""
@@ -2476,10 +3323,11 @@ class Musibisk(QMainWindow):
             self.info_panel.waveform.note_position(position)
     
     def on_playback_state_changed(self, state):
-        """Run/pause the waveform animation with the playback state"""
+        """Run/pause the visualizer animation and audio tap with the
+        playback state"""
         if self.info_panel is not None:
-            self.info_panel.waveform.set_playing(
-                state == QMediaPlayer.PlaybackState.PlayingState)
+            playing = state == QMediaPlayer.PlaybackState.PlayingState
+            self.info_panel.waveform.set_playing(playing)
     
     def update_duration(self, duration):
         """Update duration display"""
@@ -2513,7 +3361,7 @@ class Musibisk(QMainWindow):
                 else:  # NEWEST_TO_OLDEST
                     # Playing newest to oldest (top to bottom)
                     # Continue if not at bottom (last index)
-                    if self.current_index < len(self.playlist) - 1:
+                    if self.current_index < len(self.visible_songs) - 1:
                         self.next_song()
                     else:
                         self.play_pause_button.setText("▶")
@@ -2536,6 +3384,14 @@ class Musibisk(QMainWindow):
             
             if 'play_order' in config:
                 self.play_order = PlayOrder(config['play_order'])
+            
+            if 'saved_only' in config:
+                self.saved_only = bool(config['saved_only'])
+                self.update_saved_only_button()
+            
+            if 'visualizer' in config:
+                if self.info_panel is not None:
+                    self.info_panel.waveform.set_mode(config['visualizer'])
             
             if 'volume' in config:
                 self.audio_output.setVolume(config['volume'])
@@ -2577,6 +3433,9 @@ class Musibisk(QMainWindow):
         config = {
             'loop_mode': self.loop_mode.value,
             'play_order': self.play_order.value,
+            'saved_only': self.saved_only,
+            'visualizer': (self.info_panel.waveform.mode()
+                           if self.info_panel is not None else 'waveform'),
             'volume': self.audio_output.volume(),
             'initial_songs_count': self.initial_songs_count,
             'sync_enabled': self.sync_enabled,
@@ -2613,6 +3472,10 @@ class Musibisk(QMainWindow):
         # Stop and clear player
         self.player.stop()
         self.player.setSource(QUrl())
+        
+        # Stop the live audio tap (stops the in-process PyAV decoder)
+        if self.info_panel is not None:
+            self.info_panel.waveform.stop_audio_tap()
         
         # Save config
         try:
