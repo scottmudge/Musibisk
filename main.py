@@ -538,8 +538,9 @@ class SyncWorker(QThread):
 
 class PlaylistDelegate(QStyledItemDelegate):
     """Custom delegate to highlight the currently playing song and to draw
-    the ♪ icon (gold + bold when the song is marked as saved)"""
-    
+    the song icon: a ♪ normally, or a gold ★ when the song is marked as
+    saved"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.playing_row = -1
@@ -549,6 +550,8 @@ class PlaylistDelegate(QStyledItemDelegate):
         self.white = QColor("#ffffff")
         self.gray = QColor("#888888")
         self.saved_gold = QColor("#ffd700")
+        self.selected_bg = QColor("#ffd700")
+        self.selected_text = QColor("#1a1a1a")
     
     def set_playing_row(self, row: int):
         """Set which row is currently playing"""
@@ -559,55 +562,64 @@ class PlaylistDelegate(QStyledItemDelegate):
         painter.save()
         
         is_playing = (index.row() == self.playing_row)
+        is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
         bg_color = self.playing_bg if is_playing else self.default_bg
         painter.fillRect(option.rect, bg_color)
-        
+
         # FIXED: Use QStyle.StateFlag.State_Selected
-        if option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(option.rect, QColor("#4d9eff"))
-        
+        if is_selected:
+            painter.fillRect(option.rect, self.selected_bg)
+
         painter.restore()
-        
-        # The song-name column is drawn manually so the ♪ icon can be
+
+        # The song-name column is drawn manually so the icon can be
         # colored/bolded per song
         if index.column() == 0:
-            self._paint_song_cell(painter, option, index, is_playing)
+            self._paint_song_cell(painter, option, index, is_playing, is_selected)
             return
-        
+
         modified_option = QStyleOptionViewItem(option)
-        if is_playing:
-            modified_option.palette.setColor(modified_option.palette.ColorRole.Text, self.beige_gold)
+        if is_selected:
+            text_color = self.selected_text
+        elif is_playing:
+            text_color = self.beige_gold
         else:
-            modified_option.palette.setColor(modified_option.palette.ColorRole.Text, self.gray)
-        
+            text_color = self.gray
+        modified_option.palette.setColor(modified_option.palette.ColorRole.Text, text_color)
+
         super().paint(painter, modified_option, index)
     
     def _paint_song_cell(self, painter: QPainter, option: QStyleOptionViewItem,
-                         index: QModelIndex, is_playing: bool):
-        """Draw '♪ <name>' for the song column; the ♪ is gold + bold when
-        the song is marked as saved."""
+                         index: QModelIndex, is_playing: bool,
+                         is_selected: bool):
+        """Draw '<icon> <name>' for the song column: a gold + bold ★ when
+        the song is marked as saved, a ♪ otherwise."""
         text = str(index.data(Qt.ItemDataRole.DisplayRole) or '')
         saved = bool(index.data(Qt.ItemDataRole.UserRole + 1))
-        
+
         font = index.data(Qt.ItemDataRole.FontRole)
         if font is None or not font.isValid():
             font = self.parent().font()
-        
-        name_color = self.beige_gold if is_playing else self.white
-        icon_color = self.saved_gold if saved else name_color
-        
+
+        if is_selected:
+            name_color = self.selected_text
+        else:
+            name_color = self.beige_gold if is_playing else self.white
+        icon_char = '★' if saved else '♪'
+        icon_color = self.saved_gold if (saved and not is_selected) else name_color
+
         rect = option.rect.adjusted(4, 0, -4, 0)
-        
+
         icon_font = QFont(font)
         icon_font.setBold(saved)
         painter.setFont(icon_font)
-        icon_width = painter.fontMetrics().horizontalAdvance('♪') + 6
+        icon_width = painter.fontMetrics().horizontalAdvance(icon_char) + 6
         icon_rect = QRect(rect)
         icon_rect.setWidth(icon_width)
         painter.setPen(icon_color)
         painter.drawText(icon_rect,
                          Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                         '♪')
+                         icon_char)
         
         name_rect = QRect(rect)
         name_rect.setLeft(rect.left() + icon_width)
@@ -2561,8 +2573,8 @@ class Musibisk(QMainWindow):
                 border-radius: 3px;
             }
             QTableWidget::item:selected {
-                background-color: #4d9eff;
-                color: #ffffff;
+                background-color: #ffd700;
+                color: #1a1a1a;
             }
             QHeaderView::section {
                 background-color: #2d2d2d;
@@ -2604,7 +2616,7 @@ class Musibisk(QMainWindow):
                 background: #e0e0e0;
             }
             QSlider::sub-page:horizontal {
-                background: #4d9eff;
+                background: #ffd700;
                 border-radius: 3px;
             }
             QScrollBar:vertical:goove {
