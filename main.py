@@ -43,7 +43,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import (
     QAction, QKeySequence, QIcon, QPixmap, QMouseEvent, QFont, QFontDatabase,
-    QBrush, QColor, QPainter, QPainterPath, QPolygonF, QPen, QLinearGradient
+    QColor, QImage, QPainter, QPainterPath, QPolygonF, QPen
 )
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -1162,7 +1162,7 @@ class WaveformVisualizer(QWidget):
     Four visualizers share the same 260x44 box; click the box to cycle:
       waveform      - the track's full amplitude profile, scrolling
       vu            - two VU bars (left/right; identical for mono)
-      spectrum      - frequency-bin intensity bars (gray -> gold gradient)
+      spectrum      - frequency-bin intensity bars (gold, 1px continuous)
       oscilloscope  - the current audio waveform, like a real scope
 
     Low-resource design:
@@ -1206,7 +1206,6 @@ class WaveformVisualizer(QWidget):
     PLACEHOLDER_COLOR = QColor('#333333')
     PLAYHEAD_COLOR = QColor('#ffffff')
     LABEL_COLOR = QColor('#666666')
-    SPECTRUM_BASE_COLOR = QColor('#5a5a5a')  # gradient bottom (gray)
 
     _ALPHA = 0.25            # per-report low-pass factor on the clock offset
     _SNAP_THRESHOLD_MS = 1500.0  # larger discontinuities (seeks) snap
@@ -1220,10 +1219,12 @@ class WaveformVisualizer(QWidget):
     _SR = 44100
     _RATE_BPS = 44100 * 2 * 4
     _RING_FRAMES = 8192      # ring buffer of decoded frames (4096/side)
-    _SPEC_BINS = 48          # spectrum bar count
+    _SPEC_BINS = 96          # spectrum band count (rendered 1px/col)
     _SPEC_FRAME = 4096       # FFT size
-    _SPEC_F0 = 40.0          # lowest bar frequency (Hz)
-    _SPEC_F1 = 16000.0       # highest bar frequency (Hz)
+    _SPEC_F0 = 40.0          # lowest band frequency (Hz)
+    _SPEC_F1 = 16000.0       # highest band frequency (Hz)
+    _SPEC_DB_FLOOR = -60.0   # bar height 0.0 at this band RMS level
+    _SPEC_DB_TOP = -6.0      # bar height 1.0 at this band RMS level
     _SCOPE_N = 220           # oscilloscope samples shown
     _VU_DECAY = 0.88         # per-frame VU release (60 fps)
     _SPEC_DECAY = 0.90       # per-frame spectrum release while paused
@@ -1271,12 +1272,18 @@ class WaveformVisualizer(QWidget):
             self._ring_r = np.zeros(self._RING_FRAMES, dtype=np.float32)
             self._spec = np.zeros(self._SPEC_BINS, dtype=np.float32)
             self._spec_hann = np.hanning(self._SPEC_FRAME)
+            self._spec_hann_sum = float(self._spec_hann.sum())
             edges = np.logspace(np.log10(self._SPEC_F0),
                                 np.log10(self._SPEC_F1),
                                 self._SPEC_BINS + 1)
-            self._spec_edges = np.clip(
-                (edges * self._SPEC_FRAME / self._SR).astype(int),
-                0, self._SPEC_FRAME // 2).tolist()
+            e = np.clip((edges * self._SPEC_FRAME / self._SR).astype(int),
+                        0, self._SPEC_FRAME // 2)
+            # low-frequency bands are narrower than one FFT bin; force
+            # strictly increasing edges so every band gets >= 1 FFT bin
+            for i in range(1, len(e)):
+                if e[i] <= e[i - 1]:
+                    e[i] = e[i - 1] + 1
+            self._spec_edges = e.tolist()
         else:
             self._ring_l = None
             self._ring_r = None
@@ -1617,16 +1624,29 @@ class WaveformVisualizer(QWidget):
         self._timer_policy()
 
     def _update_spectrum(self):
-        """Log-spaced bin magnitudes of the last 4096 samples, with fast
-        attack / slow release smoothing."""
+        """Band RMS levels (dBFS) of the last 4096 samples, with fast
+        attack / slow release smoothing.
+
+        RMS (not max) is what a real analyzer shows: max-pooling a 93 ms
+        window picks up every transient, which pins nearly every band at
+        full scale for music. Each log band's power is the MEAN of its
+        FFT bins' power, mapped on a -60..-6 dBFS scale.
+        """
         mono = self._ring_mono(self._SPEC_FRAME)
         if mono is None:
             return
         mag = np.abs(np.fft.rfft(mono * self._spec_hann))
-        # max per log-frequency bin (edges are monotonic ints)
-        reduced = np.maximum.reduceat(mag, self._spec_edges[:-1])
-        db = 20.0 * np.log10(reduced + 1e-7)
-        target = np.clip((db + 70.0) / 60.0, 0.0, 1.0).astype(np.float32)
+        mag *= 2.0 / self._spec_hann_sum  # Hann amplitude normalization
+        power = mag * mag
+        starts = self._spec_edges[:-1]
+        ends = self._spec_edges[1:-1] + [power.size]
+        counts = np.maximum(1, np.asarray(ends) - np.asarray(starts))
+        band_power = np.add.reduceat(power, starts) / counts
+        db = 20.0 * np.log10(np.sqrt(band_power) + 1e-9)
+        target = np.clip(
+            (db - self._SPEC_DB_FLOOR)
+            / (self._SPEC_DB_TOP - self._SPEC_DB_FLOOR), 0.0, 1.0
+        ).astype(np.float32)
         prev = self._spec
         self._spec = np.where(
             target > prev,
@@ -1758,25 +1778,33 @@ class WaveformVisualizer(QWidget):
                              Qt.AlignmentFlag.AlignCenter, letter)
 
     def _paint_spectrum(self, painter, w, h):
-        """Frequency-bin bars: gray at the bottom, gold at the top."""
+        """Continuous frequency-bin graph: one 1px-wide column per pixel,
+        no gaps, in the same gold as the other visualizers.
+
+        Rendered as a single QImage blit (numpy-built, one drawImage call)
+        instead of 260 fillRects. The image is transparent everywhere
+        except the bars, so it composites over the background fill.
+        """
         if self._spec is None:
             painter.fillRect(0, h // 2, w, 1, self.PLACEHOLDER_COLOR)
             return
-        n = self._SPEC_BINS
-        gap = 1
-        bar_w = (w - gap * (n + 1)) / n
-        gradient = QLinearGradient(0, h, 0, 0)
-        gradient.setColorAt(0.0, self.SPECTRUM_BASE_COLOR)
-        gradient.setColorAt(1.0, self.ACCENT_COLOR)
-        brush = QBrush(gradient)
-        for i in range(n):
-            v = float(self._spec[i])
-            if v <= 0.01:
-                continue
-            bh = max(1, int(round(v * (h - 6))))
-            x = int(gap + i * (bar_w + gap))
-            bw = int(bar_w)
-            painter.fillRect(x, h - 2 - bh, bw, bh, brush)
+        spec = self._spec
+        # resample the 96 data bands across the full width (smooth
+        # envelope -> one continuous graph)
+        values = np.interp(np.linspace(0, spec.size - 1, w),
+                           np.arange(spec.size), spec)
+        heights = np.clip(
+            np.round(values * (h - 3)).astype(np.int32), 0, h - 3)
+        rows = np.arange(h)[:, None]
+        inside = ((rows >= (h - 2 - heights)[None, :])
+                  & (rows <= h - 3))
+        ar, ag, ab = self.ACCENT_COLOR.getRgb()[:3]
+        # ARGB32 in memory is B,G,R,A; gold bars over transparent rest
+        bgra = np.zeros((h, w, 4), dtype=np.uint8)
+        bgra[inside] = (ab, ag, ar, 255)
+        img = QImage(bgra.tobytes(), w, h, w * 4,
+                     QImage.Format.Format_ARGB32)
+        painter.drawImage(0, 0, img)
 
     def _paint_scope(self, painter, w, h):
         """The current audio waveform, like a real oscilloscope."""
