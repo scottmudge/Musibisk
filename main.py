@@ -37,13 +37,16 @@ from PyQt6.QtWidgets import (
     QStyle, QCheckBox, QLineEdit, QToolButton
 )
 from PyQt6.QtCore import (
-    Qt, QTimer, QUrl, QThread, pyqtSignal, QObject, QByteArray,
-    QModelIndex, QRect, QElapsedTimer, QPointF, QRectF
+    Qt, QTimer, QUrl, QThread, pyqtSignal, pyqtProperty, QObject,
+    QByteArray,
+    QModelIndex, QRect, QElapsedTimer, QPointF, QRectF, QEvent,
+    QPropertyAnimation, QEasingCurve
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import (
     QAction, QKeySequence, QIcon, QPixmap, QMouseEvent, QFont, QFontDatabase,
-    QColor, QImage, QPainter, QPainterPath, QPolygonF, QPen
+    QColor, QImage, QPainter, QPainterPath, QPolygonF, QPen,
+    QGuiApplication
 )
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -1823,6 +1826,180 @@ class WaveformVisualizer(QWidget):
         painter.drawPolyline(poly)
 
 
+class CoverArtOverlay(QWidget):
+    """Borderless, transparent, topmost FULL-SCREEN overlay on one screen:
+    the current track's full-resolution cover, centered, with a self-drawn
+    drop shadow, fading in and spinning into view (~500 ms, ease-out).
+
+    Everything (shadow + art) is painted by the overlay itself — child
+    widgets are not composited into a translucent top-level window
+    reliably, and QWidget has no rotation API, so the spin is a painter
+    transform about the art's center.
+
+    Dismissed by any key press, a click outside the art (including the
+    shadow margin), or losing focus (clicking elsewhere on the desktop).
+    """
+    IN_MS = 500
+    OUT_MS = 160
+    SPIN_DEG = -90.0
+    _SHADOW_MARGIN = 64  # how far the (pre-rendered) shadow extends
+    _SHADOW_STEPS = 24   # layered rounded rects approximating a blur
+
+    def __init__(self, pixmap, screen):
+        super().__init__(None)
+        self.setWindowFlags(Qt.WindowType.Tool
+                             | Qt.WindowType.FramelessWindowHint
+                             | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        geo = screen.geometry()
+        self.setGeometry(geo)
+        # show at full resolution, capped so it fits the screen — and
+        # never upscale, so the art stays pixel-perfect
+        avail = screen.availableGeometry()
+        size = pixmap.size().scaled(
+            int(avail.width() * 0.85), int(avail.height() * 0.85),
+            Qt.AspectRatioMode.KeepAspectRatio)
+        if size.width() < pixmap.width() or size.height() < pixmap.height():
+            self._shown = pixmap.scaled(
+                size, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+        else:
+            self._shown = pixmap
+        # same rounded-corner crop as the panel's cover box, scaled
+        self._radius = max(1, round(TrackInfoPanel.ART_RADIUS
+                                    * self._shown.width()
+                                    / TrackInfoPanel.ART_SIZE))
+        self._art_rect = QRectF(
+            (geo.width() - self._shown.width()) / 2.0,
+            (geo.height() - self._shown.height()) / 2.0,
+            self._shown.width(), self._shown.height())
+        self._shadow_pm = self._make_shadow(
+            self._shown.width(), self._shown.height(), self._radius)
+        self._shadow_rect = QRectF(
+            self._art_rect.x() - self._SHADOW_MARGIN,
+            self._art_rect.y() - self._SHADOW_MARGIN,
+            self._shown.width() + 2 * self._SHADOW_MARGIN,
+            self._shown.height() + 2 * self._SHADOW_MARGIN)
+        self._closing = False
+        self._spin_deg = self.SPIN_DEG
+        self._alpha = 0.0
+        self._progress = 0.0
+        # fade + spin in, driven by one eased progress property
+        anim = QPropertyAnimation(self, b'progress', self)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setDuration(self.IN_MS)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._in_anim = anim
+        self._out_anim = None
+        anim.start()
+
+    # -------------------------------------------------------- pre-render
+    def _make_shadow(self, w, h, radius):
+        """Soft drop shadow as concentric rounded rects (outer, faintest
+        first) — pre-rendered once, drawn every frame under the same
+        transform as the art so it rotates with it."""
+        m = self._SHADOW_MARGIN
+        steps = self._SHADOW_STEPS
+        pm = QPixmap(w + 2 * m, h + 2 * m)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for i in range(steps, 0, -1):
+            grow = int(i * m / steps)
+            t = 1.0 - i / steps
+            alpha = int(110 * (t * t) ** 0.75)
+            if alpha <= 0:
+                continue
+            painter.setBrush(QColor(0, 0, 0, alpha))
+            painter.drawRoundedRect(
+                QRect(m - grow, m - grow, w + 2 * grow, h + 2 * grow),
+                radius + grow, radius + grow)
+        painter.end()
+        return pm
+
+    # -------------------------------------------------------------- props
+    def get_progress(self):
+        return self._progress
+
+    def set_progress(self, value):
+        self._progress = float(value)
+        self._spin_deg = self.SPIN_DEG * (1.0 - self._progress)
+        self._alpha = self._progress
+        self.update()
+
+    progress = pyqtProperty(float, get_progress, set_progress)
+
+    def get_alpha(self):
+        return self._alpha
+
+    def set_alpha(self, value):
+        self._alpha = float(value)
+        self.update()
+
+    alpha = pyqtProperty(float, get_alpha, set_alpha)
+
+    # ------------------------------------------------------------ dismiss
+    def dismiss(self):
+        """Fade out quickly and close (any key / outside click / focus loss)."""
+        if self._closing or not self.isVisible():
+            return
+        self._closing = True
+        self._in_anim.stop()
+        self._spin_deg = 0.0
+        fade = QPropertyAnimation(self, b'alpha', self)
+        fade.setStartValue(float(self._alpha))
+        fade.setEndValue(0.0)
+        fade.setDuration(self.OUT_MS)
+        fade.setEasingCurve(QEasingCurve.Type.InCubic)
+        fade.finished.connect(self.close)
+        self._out_anim = fade
+        fade.start()
+
+    # -------------------------------------------------------------- events
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.activateWindow()
+        self.setFocus()
+
+    def keyPressEvent(self, event):
+        self.dismiss()
+
+    def mousePressEvent(self, event):
+        # a click anywhere outside the art dismisses; a click on the art
+        # itself keeps it up
+        if not self._art_rect.contains(event.position()):
+            self.dismiss()
+        super().mousePressEvent(event)
+
+    def focusOutEvent(self, event):
+        self.dismiss()
+        super().focusOutEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        center = self._art_rect.center()
+        painter.translate(center)
+        painter.rotate(self._spin_deg)
+        painter.translate(-center)
+        painter.setOpacity(self._alpha)
+        painter.drawPixmap(
+            int(self._shadow_rect.x()), int(self._shadow_rect.y()),
+            int(self._shadow_rect.width()), int(self._shadow_rect.height()),
+            self._shadow_pm)
+        path = QPainterPath()
+        path.addRoundedRect(self._art_rect, self._radius, self._radius)
+        painter.setClipPath(path)
+        painter.drawPixmap(
+            int(self._art_rect.x()), int(self._art_rect.y()),
+            int(self._art_rect.width()), int(self._art_rect.height()),
+            self._shown)
+
+
 class TrackInfoPanel(QWidget):
     """Right-side panel that displays the current track's metadata.
 
@@ -1836,9 +2013,14 @@ class TrackInfoPanel(QWidget):
     ART_SIZE = 220
     ART_RADIUS = 10
 
+    # emitted when the cover art (a real one, not the placeholder) is
+    # clicked — the main window opens the full-resolution cover overlay
+    cover_clicked = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_path: Optional[Path] = None
+        self._full_cover: Optional[QPixmap] = None
 
         self.setFixedWidth(self.WIDTH)
 
@@ -1865,6 +2047,7 @@ class TrackInfoPanel(QWidget):
         self.cover_label.setStyleSheet(
             "background-color: #2d2d2d; border-radius: "
             f"{self.ART_RADIUS}px;")
+        self.cover_label.installEventFilter(self)
         self.cover_glyph = QLabel("♫", self.cover_label)
         self.cover_glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover_glyph.setStyleSheet("font-size: 72px; color: #444444;")
@@ -1925,15 +2108,20 @@ class TrackInfoPanel(QWidget):
             fmt = cover[1].split('/')[-1].upper()
             pixmap.loadFromData(QByteArray(cover[0]), fmt)
             if not pixmap.isNull():
+                # keep the original (full resolution) for the overlay
+                self._full_cover = pixmap
                 scaled = pixmap.scaled(
                     self.ART_SIZE, self.ART_SIZE,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation)
                 self.cover_label.setPixmap(self._round_pixmap(scaled))
                 self.cover_glyph.setVisible(False)
+                self._update_cover_clickability()
                 return
+        self._full_cover = None
         self.cover_label.setPixmap(QPixmap())
         self.cover_glyph.setVisible(True)
+        self._update_cover_clickability()
 
     def clear(self):
         """Reset the panel to the 'no track' state."""
@@ -1943,8 +2131,31 @@ class TrackInfoPanel(QWidget):
         self.title_label.setVisible(True)
         for lbl in (self.artist_label, self.album_label, self.extra_label):
             self._set_field(lbl, None)
+        self._full_cover = None
         self.cover_label.setPixmap(QPixmap())
         self.cover_glyph.setVisible(True)
+        self._update_cover_clickability()
+
+    def full_cover_pixmap(self) -> Optional[QPixmap]:
+        """The current track's full-resolution cover, or None."""
+        return self._full_cover
+
+    def _update_cover_clickability(self):
+        has_art = self._full_cover is not None
+        self.cover_label.setCursor(
+            Qt.CursorShape.PointingHandCursor if has_art
+            else Qt.CursorShape.ArrowCursor)
+        self.cover_label.setToolTip(
+            'Click to view the cover in full size' if has_art else '')
+
+    def eventFilter(self, obj, event):
+        if (obj is self.cover_label
+                and event.type() == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton
+                and self._full_cover is not None):
+            self.cover_clicked.emit()
+            return True
+        return super().eventFilter(obj, event)
 
     def _round_pixmap(self, pixmap: QPixmap) -> QPixmap:
         """Return a copy of the pixmap with anti-aliased rounded corners,
@@ -2273,10 +2484,36 @@ class Musibisk(QMainWindow):
         
         # Track info panel (right side)
         self.info_panel = TrackInfoPanel(left_widget)
+        self._cover_overlay = None
+        self.info_panel.cover_clicked.connect(self.show_cover_full)
         
         root_layout.addWidget(left_widget, 1)
         root_layout.addWidget(panel_separator)
         root_layout.addWidget(self.info_panel)
+
+    def show_cover_full(self):
+        """Open the full-resolution cover in a borderless, transparent,
+        topmost overlay centered on the SAME screen as the main window
+        (multi-monitor aware). Any key, a click outside the art, or
+        losing focus dismisses it."""
+        pixmap = self.info_panel.full_cover_pixmap()
+        if pixmap is None or pixmap.isNull():
+            return  # placeholder (no embedded art) — nothing to open
+        if self._cover_overlay is not None:
+            if self._cover_overlay.isVisible():
+                self._cover_overlay.dismiss()  # toggle closed
+                return
+            self._cover_overlay = None  # stale (already deleted)
+        screen = QGuiApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        overlay = CoverArtOverlay(pixmap, screen)
+        overlay.destroyed.connect(
+            lambda: setattr(self, '_cover_overlay', None))
+        self._cover_overlay = overlay
+        overlay.show()
+        overlay.raise_()
+        overlay.activateWindow()
     
     def apply_style(self):
         """Apply dark theme styling"""
@@ -3504,6 +3741,10 @@ class Musibisk(QMainWindow):
         # Stop the live audio tap (stops the in-process PyAV decoder)
         if self.info_panel is not None:
             self.info_panel.waveform.stop_audio_tap()
+        
+        # Dismiss the full-resolution cover overlay, if open
+        if self._cover_overlay is not None:
+            self._cover_overlay.close()
         
         # Save config
         try:
