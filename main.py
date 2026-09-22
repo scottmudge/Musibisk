@@ -1842,7 +1842,7 @@ class CoverArtOverlay(QWidget):
     IN_MS = 500
     OUT_MS = 160
     SPIN_DEG = -90.0
-    _SHADOW_MARGIN = 64  # how far the (pre-rendered) shadow extends
+    _SHADOW_MARGIN = 32  # how far the (pre-rendered) shadow extends
     _SHADOW_STEPS = 24   # layered rounded rects approximating a blur
 
     def __init__(self, pixmap, screen):
@@ -1910,7 +1910,7 @@ class CoverArtOverlay(QWidget):
         for i in range(steps, 0, -1):
             grow = int(i * m / steps)
             t = 1.0 - i / steps
-            alpha = int(110 * (t * t) ** 0.75)
+            alpha = int(50 * (t * t) ** 0.75)
             if alpha <= 0:
                 continue
             painter.setBrush(QColor(0, 0, 0, alpha))
