@@ -1012,6 +1012,8 @@ class WaveformVisualizer(QWidget):
 
     _ALPHA = 0.25            # per-report low-pass factor on the clock offset
     _SNAP_THRESHOLD_MS = 1500.0  # larger discontinuities (seeks) snap
+    _PAUSED_STALE_MS = 1000.0    # backward reports this close while paused
+    # are stale samples from the just-paused buffer and are ignored
     _FRAME_PERIOD = 1000.0 / 60.0  # 60 FPS drawing grid
     _TIMER_MS = 2            # wake frequently enough to hit the grid on time
 
@@ -1067,8 +1069,8 @@ class WaveformVisualizer(QWidget):
         """Start/stop the animation timer with the playback state."""
         if playing == self._playing:
             return
-        self._playing = playing
         if playing:
+            self._playing = True
             if not self._offset_init:
                 # fresh track: the position starts at zero NOW (the anchor
                 # set in set_track may predate the actual playback start)
@@ -1078,6 +1080,13 @@ class WaveformVisualizer(QWidget):
             if self._peaks:
                 self._timer.start()
         else:
+            # Pause: FREEZE — fold the elapsed time (and correction) into
+            # the anchor so the displayed position stays exactly where it
+            # is, and resuming continues from there without a jump.
+            self._anchor_pos = self._current_position()
+            self._anchor_time = self._clock.elapsed()
+            self._offset = 0.0
+            self._playing = False
             self._timer.stop()
         self.update()
 
@@ -1107,10 +1116,16 @@ class WaveformVisualizer(QWidget):
             else:
                 self._offset += (dev - self._offset) * self._ALPHA
         else:
-            self._anchor_pos = float(pos_ms)
-            self._anchor_time = now
-            self._offset = 0.0
-            self._offset_init = False
+            # Paused: adopt forward reports (buffer drain / seek forward)
+            # and well-behind reports (a real seek back); a report that is
+            # slightly behind is a stale sample from the just-paused buffer
+            # and is ignored so the frozen position holds.
+            cur = self._current_position()
+            if float(pos_ms) > cur or cur - float(pos_ms) > self._PAUSED_STALE_MS:
+                self._anchor_pos = float(pos_ms)
+                self._anchor_time = now
+                self._offset = 0.0
+                self._offset_init = True
         if not self._playing or not self._timer.isActive():
             self.update()
 
@@ -1360,6 +1375,11 @@ class Musibisk(QMainWindow):
         
         # State
         self.playlist: List[Path] = []
+        # The view the UI and playback actually use: all songs, or (when
+        # saved_only is on) just the saved ones. current_index is an index
+        # into visible_songs, never into playlist.
+        self.visible_songs: List[Path] = []
+        self.saved_only: bool = False
         self.current_index: int = -1
         self.loop_mode = LoopMode.NO_LOOP
         self.play_order = PlayOrder.OLDEST_TO_NEWEST
@@ -1588,6 +1608,13 @@ class Musibisk(QMainWindow):
         self.delete_button.clicked.connect(self.handle_delete_click)
         self.delete_button.setToolTip("Double-click to delete song")
         
+        # Saved-only filter button (trophy), right of the delete button
+        self.saved_only_button = GlyphCenteredButton("🏆")
+        self.saved_only_button.setStyleSheet(BUTTON_FONT_SIZE)
+        self.saved_only_button.setFixedSize(button_size, button_size)
+        self.saved_only_button.clicked.connect(self.toggle_saved_only)
+        self.saved_only_button.setToolTip("Show only saved songs (Ctrl+F)")
+        
         self.volume_slider = QSlider(Qt.Orientation.Vertical)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(int(self.audio_output.volume() * 100))
@@ -1617,6 +1644,7 @@ class Musibisk(QMainWindow):
         controls_layout.addWidget(separator)
         controls_layout.addWidget(self.save_button)
         controls_layout.addWidget(self.delete_button)
+        controls_layout.addWidget(self.saved_only_button)
         controls_layout.addWidget(separator)
         controls_layout.addWidget(self.volume_slider)
         controls_layout.addStretch()
@@ -1791,8 +1819,8 @@ class Musibisk(QMainWindow):
         """Refresh the track info panel for the current (or absent) track."""
         if self.info_panel is None:
             return
-        if 0 <= self.current_index < len(self.playlist):
-            self.info_panel.set_track(self.playlist[self.current_index])
+        if 0 <= self.current_index < len(self.visible_songs):
+            self.info_panel.set_track(self.visible_songs[self.current_index])
         else:
             self.info_panel.clear()
 
@@ -1822,6 +1850,7 @@ class Musibisk(QMainWindow):
         self.addAction(self.create_shortcut("Space", self.toggle_play_pause))
         self.addAction(self.create_shortcut("Right", self.next_song))
         self.addAction(self.create_shortcut("Left", self.previous_song))
+        self.addAction(self.create_shortcut("Ctrl+F", self.toggle_saved_only))
     
     def create_shortcut(self, key: str, callback):
         """Helper to create keyboard shortcuts"""
@@ -1893,44 +1922,170 @@ class Musibisk(QMainWindow):
         # Save config
         self.save_config()
     
+    def _rebuild_visible_songs(self):
+        """(Re)compute the playlist view the UI and playback use."""
+        if self.saved_only:
+            self.visible_songs = [
+                p for p in self.playlist if self.is_song_saved(p)]
+        else:
+            # alias: incremental playlist edits stay in sync automatically
+            self.visible_songs = self.playlist
+
+    def _rebuild_playlist_widget(self):
+        """Repopulate the playlist table from the visible view"""
+        self.playlist_widget.setRowCount(0)
+        for f in self.visible_songs:
+            self.add_to_playlist_widget(f)
+        if self.current_index >= 0:
+            self.highlight_current_song()
+
+    def _next_seq_index(self, index: int, count: int) -> int:
+        """Next index in the playback sequence (same rules as
+        get_next_index, but for an explicit index/count)."""
+        if count == 0:
+            return -1
+        if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
+            return (index + 1) % count
+        next_idx = index - 1
+        if next_idx < 0:
+            next_idx = count - 1
+        return next_idx
+
+    def _clear_current_song(self):
+        """Drop the current selection (no song loaded state)"""
+        self.current_index = -1
+        self.song_label.setText("No song loaded")
+        self.play_pause_button.setText("▶")
+        self._update_track_info()
+        self.highlight_current_song()
+
+    def _apply_saved_only_filter(self):
+        """Rebuild the visible playlist after the saved-only filter (or a
+        song's saved state) changed.
+
+        - If the current song survives, keep playing/paused exactly where
+          it was and just remap its (moved) index.
+        - If it drops out, the next song is the next saved song in the
+          playback sequence; playback continues if it was running.
+        - If nothing was selected, pick the normal starting song.
+        """
+        was_playing = (self.player.playbackState()
+                       == QMediaPlayer.PlaybackState.PlayingState)
+        old_visible = self.visible_songs
+        old_index = self.current_index
+        current_file = (old_visible[old_index]
+                        if 0 <= old_index < len(old_visible) else None)
+
+        self._rebuild_visible_songs()
+        survived = (current_file is not None
+                    and current_file in self.visible_songs)
+
+        # next song in the sequence that remains visible (for the case the
+        # current song drops out of the filtered view)
+        next_file = None
+        if current_file is not None and not survived:
+            i, n = old_index, len(old_visible)
+            for _ in range(n):
+                i = self._next_seq_index(i, n)
+                candidate = old_visible[i]
+                if candidate in self.visible_songs:
+                    next_file = candidate
+                    break
+
+        self._rebuild_playlist_widget()
+
+        if survived:
+            self.current_index = self.visible_songs.index(current_file)
+            self.highlight_current_song()
+        elif current_file is not None:
+            self.player.stop()
+            if next_file is not None:
+                self.current_index = self.visible_songs.index(next_file)
+                self.load_current_song()
+                if was_playing:
+                    self.player.play()
+                    self.play_pause_button.setText("⏸")
+                else:
+                    self.play_pause_button.setText("▶")
+            else:
+                self._clear_current_song()
+        elif self.visible_songs:
+            self.current_index = self.get_starting_index()
+            self.load_current_song()
+            self.highlight_current_song()
+
+        self.reset_delete_state()
+        self.update_save_button()
+
+    def toggle_saved_only(self):
+        """Toggle the 'saved songs only' playlist filter (trophy button /
+        Ctrl+F)."""
+        self.saved_only = not self.saved_only
+        self.update_saved_only_button()
+        self.save_config()
+        self._apply_saved_only_filter()
+
+    def update_saved_only_button(self):
+        """Highlight the trophy button while the filter is on"""
+        if self.saved_only:
+            self.saved_only_button.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: #C38C31;
+                    color: #ffffff;
+                    border: 1px solid #3d3d3d;
+                    border-radius: 10px;
+                    {BUTTON_FONT_SIZE}
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: #ECAA40;
+                    border: 1px solid #4d4d4d;
+                }}
+                QPushButton:pressed {{
+                    background-color: #ECAA40;
+                }}
+            """)
+        else:
+            self.saved_only_button.setStyleSheet(BUTTON_FONT_SIZE)
+
     def get_next_index(self):
         """Get the next song index based on play order"""
-        if not self.playlist:
+        if not self.visible_songs:
             return -1
         
         if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
             # Moving forward through the list (bottom to top in display)
-            return (self.current_index + 1) % len(self.playlist)
+            return (self.current_index + 1) % len(self.visible_songs)
         else:  # NEWEST_TO_OLDEST
             # Moving backward through the list (top to bottom in display)
             next_idx = self.current_index - 1
             if next_idx < 0:
-                next_idx = len(self.playlist) - 1
+                next_idx = len(self.visible_songs) - 1
             return next_idx
     
     def get_previous_index(self):
         """Get the previous song index based on play order"""
-        if not self.playlist:
+        if not self.visible_songs:
             return -1
         
         if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
             # Moving backward through the list (top to bottom in display)
             prev_idx = self.current_index - 1
             if prev_idx < 0:
-                prev_idx = len(self.playlist) - 1
+                prev_idx = len(self.visible_songs) - 1
             return prev_idx
         else:  # NEWEST_TO_OLDEST
             # Moving forward through the list (bottom to top in display)
-            return (self.current_index + 1) % len(self.playlist)
+            return (self.current_index + 1) % len(self.visible_songs)
     
     def get_starting_index(self):
         """Get the index to start playing from based on play order"""
-        if not self.playlist:
+        if not self.visible_songs:
             return -1
         
         if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
             # Start at the end (oldest song, which is at bottom)
-            return len(self.playlist) - 1
+            return len(self.visible_songs) - 1
         else:  # NEWEST_TO_OLDEST
             # Start at the beginning (newest song, which is at top)
             return 0
@@ -1952,15 +2107,17 @@ class Musibisk(QMainWindow):
         
         # Clear playlist and add files
         self.playlist.clear()
-        self.playlist_widget.setRowCount(0)
         
         # Add files in order (most recent first, so they appear at top)
         for file in files:
             self.playlist.append(file)
-            self.add_to_playlist_widget(file)
+        
+        # Refresh the view and the table
+        self._rebuild_visible_songs()
+        self._rebuild_playlist_widget()
         
         # Start playing from the appropriate position based on play order
-        if self.playlist and self.current_index == -1:
+        if self.visible_songs and self.current_index == -1:
             self.current_index = self.get_starting_index()
             self.load_current_song()
             self.highlight_current_song()
@@ -1969,18 +2126,22 @@ class Musibisk(QMainWindow):
         """Add a new file to the playlist"""
         path = Path(filepath)
         if path not in self.playlist:
-            # Insert at the beginning (top) of the playlist
+            # Insert at the beginning (top) of the canonical playlist
             self.playlist.insert(0, path)
-            self.add_to_playlist_widget_at_top(path)
+            self._rebuild_visible_songs()
             
-            # Adjust current index if necessary
-            if self.current_index >= 0:
-                self.current_index += 1
-                # Update the highlighted row to match the new index
-                self.highlight_current_song()
+            # Only unsaved songs are hidden by the saved-only filter
+            if path in self.visible_songs:
+                self.add_to_playlist_widget_at_top(path)
+                
+                # Adjust current index if necessary
+                if self.current_index >= 0:
+                    self.current_index += 1
+                    # Update the highlighted row to match the new index
+                    self.highlight_current_song()
             
             # If nothing is playing, start playing from the appropriate position
-            if self.current_index == -1:
+            if self.current_index == -1 and self.visible_songs:
                 self.current_index = self.get_starting_index()
                 self.load_current_song()
                 self.highlight_current_song()
@@ -1994,40 +2155,42 @@ class Musibisk(QMainWindow):
         if path not in self.playlist:
             return
         
-        index = self.playlist.index(path)
+        was_visible = path in self.visible_songs
+        index = self.visible_songs.index(path) if was_visible else -1
         was_current = (index == self.current_index)
         
         # Keep the remote consistent: if it was a saved song, remove it
         # from the server (no-op there if it doesn't exist). The file is
-        # already gone, so the saved state comes from the row's cached
-        # flag (kept in sync by toggle_save_song), not the tag.
-        item = self.playlist_widget.item(index, 0)
+        # already gone, so for visible rows the saved state comes from the
+        # row's cached flag (kept in sync by toggle_save_song), not the tag.
+        item = (self.playlist_widget.item(index, 0)
+                if was_visible else None)
         was_saved = (bool(item.data(Qt.ItemDataRole.UserRole + 1))
                      if item is not None else self.is_song_saved(path))
         if was_saved:
             self.sync_remove(self.get_remote_name(path))
         
-        del self.playlist[index]
-        self.playlist_widget.removeRow(index)
+        self.playlist.remove(path)
+        self._rebuild_visible_songs()
+        if was_visible:
+            self.playlist_widget.removeRow(index)
         
         if was_current:
             self.player.stop()
-            if self.playlist:
+            if self.visible_songs:
                 # The next song slid into this index
-                if self.current_index >= len(self.playlist):
+                if self.current_index >= len(self.visible_songs):
                     self.current_index = 0
                 self.load_current_song()
                 self.player.play()
                 self.play_pause_button.setText("⏸")
             else:
-                self.current_index = -1
-                self.song_label.setText("No song loaded")
-                self.play_pause_button.setText("▶")
-                self._update_track_info()
+                self._clear_current_song()
         else:
-            if index < self.current_index:
+            if was_visible and index < self.current_index:
                 self.current_index -= 1
-            self.highlight_current_song()
+            if self.current_index >= 0:
+                self.highlight_current_song()
     
     def get_formatted_timestamp(self, filepath: Path) -> str:
         """Get formatted timestamp for file modification time"""
@@ -2113,8 +2276,8 @@ class Musibisk(QMainWindow):
         if item:
             filepath = item.data(Qt.ItemDataRole.UserRole)
             try:
-                index = self.playlist.index(filepath)
-                
+                index = self.visible_songs.index(filepath)
+
                 # Store current scroll position
                 scrollbar = self.playlist_widget.verticalScrollBar()
                 scroll_pos = scrollbar.value()
@@ -2141,8 +2304,8 @@ class Musibisk(QMainWindow):
     
     def load_current_song(self):
         """Load the current song into the player"""
-        if 0 <= self.current_index < len(self.playlist):
-            filepath = self.playlist[self.current_index]
+        if 0 <= self.current_index < len(self.visible_songs):
+            filepath = self.visible_songs[self.current_index]
             self.player.setSource(QUrl.fromLocalFile(str(filepath)))
             
             # Update song label with metadata or filename
@@ -2252,10 +2415,10 @@ class Musibisk(QMainWindow):
     def toggle_save_song(self):
         """Toggle the save status of the current song (embedded tag; the
         filename never changes)"""
-        if self.current_index < 0 or self.current_index >= len(self.playlist):
+        if self.current_index < 0 or self.current_index >= len(self.visible_songs):
             return
         
-        current_file = self.playlist[self.current_index]
+        current_file = self.visible_songs[self.current_index]
         
         if not current_file.exists():
             return
@@ -2283,11 +2446,16 @@ class Musibisk(QMainWindow):
             self.sync_upload(current_file, self.get_remote_name(current_file))
         else:
             self.sync_remove(self.get_remote_name(current_file))
+        
+        if self.saved_only and not now_saved:
+            # This song just dropped out of the saved-only playlist:
+            # the next song to play is the next saved one in the sequence
+            self._apply_saved_only_filter()
     
     def update_save_button(self):
         """Update save button appearance based on current song's save status"""
-        if self.current_index >= 0 and self.current_index < len(self.playlist):
-            current_file = self.playlist[self.current_index]
+        if self.current_index >= 0 and self.current_index < len(self.visible_songs):
+            current_file = self.visible_songs[self.current_index]
             if self.is_song_saved(current_file):
                 self.save_button.setStyleSheet(f"""
                     QPushButton {{
@@ -2339,10 +2507,11 @@ class Musibisk(QMainWindow):
     
     def delete_current_song(self):
         """Delete the current song file and move to next"""
-        if self.current_index < 0 or self.current_index >= len(self.playlist):
+        if (self.current_index < 0
+                or self.current_index >= len(self.visible_songs)):
             return
         
-        current_file = self.playlist[self.current_index]
+        current_file = self.visible_songs[self.current_index]
         
         if not current_file.exists():
             return
@@ -2362,27 +2531,22 @@ class Musibisk(QMainWindow):
             # Remote sync: remove from remote server if it exists
             self.sync_remove(self.get_remote_name(current_file))
             
-            # Remove from playlist
-            del self.playlist[self.current_index]
+            # Remove from the canonical playlist and the visible view.
+            # When the filter is off, visible_songs aliases playlist, so
+            # remove only ONCE (a second removal would eat the next song).
+            if self.visible_songs is self.playlist:
+                del self.visible_songs[self.current_index]
+            else:
+                self.playlist.remove(current_file)
+                del self.visible_songs[self.current_index]
             self.playlist_widget.removeRow(self.current_index)
             
-            # Move to next song or stop if no more songs
-            if self.playlist:
-                # Determine next index based on play order
-                if self.play_order == PlayOrder.OLDEST_TO_NEWEST:
-                    # Playing bottom-to-top (increasing indices)
-                    # After deletion, current_index now points to what was the next song
-                    # If we deleted the last song, wrap to beginning
-                    if self.current_index >= len(self.playlist):
-                        self.current_index = 0
-                    # Otherwise current_index is already pointing at the next song
-                else:  # NEWEST_TO_OLDEST
-                    # Playing top-to-bottom (decreasing indices)
-                    # After deletion at position N, the song that was at N+1 is now at N
-                    # We want to continue downward, so stay at current_index
-                    # But if we deleted at the bottom, go to top
-                    if self.current_index >= len(self.playlist):
-                        self.current_index = 0
+            # Move to next song or stop if no more songs. After removal,
+            # current_index points at whatever slid into its place; wrap
+            # if we deleted the last row.
+            if self.visible_songs:
+                if self.current_index >= len(self.visible_songs):
+                    self.current_index = 0
                 
                 # Load and play next song
                 self.load_current_song()
@@ -2390,10 +2554,7 @@ class Musibisk(QMainWindow):
                 self.play_pause_button.setText("⏸")
             else:
                 # No more songs
-                self.current_index = -1
-                self.song_label.setText("No song loaded")
-                self.play_pause_button.setText("▶")
-                self._update_track_info()
+                self._clear_current_song()
             
         except Exception as e:
             print(f"Error deleting file: {e}")
@@ -2404,7 +2565,7 @@ class Musibisk(QMainWindow):
             self.player.pause()
             self.play_pause_button.setText("▶")
         else:
-            if self.current_index == -1 and self.playlist:
+            if self.current_index == -1 and self.visible_songs:
                 self.current_index = self.get_starting_index()
                 self.load_current_song()
             self.player.play()
@@ -2412,7 +2573,7 @@ class Musibisk(QMainWindow):
     
     def next_song(self):
         """Skip to next song"""
-        if not self.playlist:
+        if not self.visible_songs:
             return
         
         if self.loop_mode == LoopMode.LOOP_SINGLE:
@@ -2429,7 +2590,7 @@ class Musibisk(QMainWindow):
     
     def previous_song(self):
         """Go to previous song"""
-        if not self.playlist:
+        if not self.visible_songs:
             return
         
         # If more than 3 seconds into song, restart it
@@ -2513,7 +2674,7 @@ class Musibisk(QMainWindow):
                 else:  # NEWEST_TO_OLDEST
                     # Playing newest to oldest (top to bottom)
                     # Continue if not at bottom (last index)
-                    if self.current_index < len(self.playlist) - 1:
+                    if self.current_index < len(self.visible_songs) - 1:
                         self.next_song()
                     else:
                         self.play_pause_button.setText("▶")
@@ -2536,6 +2697,10 @@ class Musibisk(QMainWindow):
             
             if 'play_order' in config:
                 self.play_order = PlayOrder(config['play_order'])
+            
+            if 'saved_only' in config:
+                self.saved_only = bool(config['saved_only'])
+                self.update_saved_only_button()
             
             if 'volume' in config:
                 self.audio_output.setVolume(config['volume'])
@@ -2577,6 +2742,7 @@ class Musibisk(QMainWindow):
         config = {
             'loop_mode': self.loop_mode.value,
             'play_order': self.play_order.value,
+            'saved_only': self.saved_only,
             'volume': self.audio_output.volume(),
             'initial_songs_count': self.initial_songs_count,
             'sync_enabled': self.sync_enabled,
